@@ -1,0 +1,431 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{titlesec}
+\usepackage{microtype}
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!40!black}
+
+\titleformat{\section}{\large\bfseries}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.6em}{}
+
+\newcommand{\F}{\mathbf{F}}
+\newcommand{\WO}{\mathbf{W}_O}
+\newcommand{\WV}{\mathbf{W}_V}
+\newcommand{\vv}{\mathbf{v}}
+\newcommand{\kk}{\mathbf{k}}
+\newcommand{\hh}{\mathbf{h}}
+\newcommand{\zz}{\mathbf{z}}
+\newcommand{\pp}{\mathbf{p}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\TopK}{\mathrm{TopK}}
+\newcommand{\softmax}{\mathrm{softmax}}
+
+\title{\textbf{Residual Accounting, Representational Momentum, and \\ White-Box Thought-Anchor Detection in Reasoning Models}\\[0.4em]
+\large A Research Proposal}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+Reasoning language models produce long chains of thought (CoT) in which a small number of
+sentences---\emph{thought anchors}---disproportionately steer the remaining computation
+\cite{bogdan2025thought}. Anchors are presently identified \emph{retrospectively} and
+expensively, via black-box counterfactual resampling. This proposal asks whether anchors
+can be identified \emph{white-box} and, ultimately, \emph{online}, from quantities computed
+during a single forward pass. We build on an established per-source-token decomposition of
+the attention update \cite{kobayashi2020attention,kobayashi2021incorporating,ferrando2024information}
+to define a \emph{delivered residual contribution} graph, propagate influence through it with a
+Katz-style recursion, and pair this with a \emph{representational momentum} signal derived from
+the trajectory of hidden states. We are explicit throughout about which components are
+established prior art, which are incremental, and which are the genuinely open empirical
+questions. The central bet of the proposal is a single falsifiable claim: that a cheap,
+forward-time signal predicts black-box anchor importance better than the existing attention
+baseline ($\rho \approx 0.22$ in \cite{bogdan2025thought}). All experiments are scoped to a
+single 1.5B-parameter reasoning model on commodity (RTX TITAN-class) hardware.
+\end{abstract}
+
+\section{Background and prior work}
+
+\paragraph{The residual stream and additive decomposition.}
+Following the residual-stream view of transformers \cite{elhage2021mathematical}, every component
+writes additively into a shared representation, and attention heads act independently, each
+adding a result back into the stream. Because attention is linear in the value vectors once the
+attention weights are fixed, the attention update can be decomposed by \emph{source token}.
+
+\paragraph{Per-source contributions: attention is not only a weight.}
+Kobayashi et al.\ \cite{kobayashi2020attention} observed that attention weights alone do not
+describe information flow, because the attention block computes a weighted sum of
+\emph{transformed} value vectors; a token with high attention weight but small transformed-value
+norm contributes little. Their reformulation, extended to multi-head and to the residual and
+normalization layers in \cite{kobayashi2021incorporating}, expresses the layer output as a sum of
+per-source contribution functions $\mathbf{F}_i(\mathbf{x}_j)$ with the output projection folded in.
+ALTI \cite{ferrando2022measuring}, GlobEnc \cite{modarressi2022globenc}, and DecompX
+\cite{modarressi2023decompx} build token-attribution graphs on top of this decomposition and
+aggregate contributions across layers (DecompX by propagating decomposed vectors rather than a
+rollout recursion). Information Flow Routes \cite{ferrando2024information} carries the construction
+to decoder-only LLMs, folding the combined value--output matrix $\mathbf{W}_{OV}=\WV\WO$ and a
+linearized LayerNorm into per-(source, head) contributions.
+
+\paragraph{Propagation across the graph: rollout and flow.}
+Abnar and Zuidema \cite{abnar2020quantifying} introduced attention rollout (iterated matrix
+multiplication of per-layer attention) and attention flow (a max-flow formulation) to approximate
+multi-hop, indirect token influence. ALTI and GlobEnc replace raw attention with Kobayashi-style
+contributions inside the same rollout machinery. Recent work extends multi-hop, recursive
+attribution specifically to \emph{reasoning} traces at token- and sentence-level granularity
+\cite{ferrando2024information}. The recursion we use below is, mathematically, a discounted
+reachability / Katz--Bonacich centrality \cite{katz1953new} on the contribution DAG.
+
+\paragraph{Thought anchors.}
+Bogdan et al.\ \cite{bogdan2025thought} define thought anchors and provide three attribution
+methods: (i) a \emph{black-box} method measuring each sentence's counterfactual importance over
+100 resampled rollouts; (ii) a \emph{white-box} method aggregating attention between sentence
+pairs, identifying ``broadcasting'' sentences attended to by ``receiver'' heads; and (iii) a
+\emph{causal} method that suppresses attention toward a sentence and measures the downstream
+effect. Crucially, their white-box receiver-head signal correlates with the black-box ground truth
+only weakly (Spearman $\rho \approx 0.22$). This number is the baseline this proposal must beat.
+
+\paragraph{Hidden-state dynamics and ``physics'' framings.}
+A growing literature treats the sequence of hidden states as a trajectory or dynamical system:
+drift-diffusion / regime-switching models of sentence-level trajectories
+\cite{statphys2025}, trajectory-extrapolation and momentum-of-language analyses
+\cite{trajdyn2026}, and decompositions of reasoning motion into displacement (progress) and
+curvature (stability) \cite{semstep2026}. Test-time steering of ``cognitive'' attention heads has
+been demonstrated on the same 1.5B model we target \cite{steering2025}.
+
+\paragraph{Causal interventions.}
+Activation patching / causal tracing \cite{meng2022locating,wang2023interpretability} and
+attention knockout \cite{rai2024how} are standard tools for testing whether a component is
+necessary or sufficient for a behavior. Our intervention experiments (Section~\ref{sec:explore})
+are instances of these, applied at the granularity of anchors.
+
+\paragraph{Speculative decoding.}
+Speculative decoding \cite{leviathan2023fast} uses a small draft model to propose tokens that a
+large target model verifies in parallel, preserving the target distribution and yielding
+$2$--$3\times$ (up to $\sim$$6\times$ for EAGLE-class methods \cite{li2024eagle}) latency
+reductions; it is standard in production serving. Reward-guided variants \cite{liao2025reward}
+already switch adaptively between draft and target based on a quality signal. Our
+``anchor-gated'' compute-allocation idea (Section~\ref{sec:explore}) is a special case of this
+adaptive-switching family, with an interpretability-derived trigger.
+
+\section{Notation and the core object}
+
+Let a reasoning trace have tokens $1,\dots,T$. At layer $\ell$ and head $h$, let
+$\alpha^{\ell,h}_{t,s}$ be the attention weight from target token $t$ to source token $s\le t$,
+$\vv^{\ell,h}_s$ the value vector, $\kk^{\ell,h}_s$ the key vector, and $\WO^{h,\ell}$ the
+head's output projection. The attention update written into token $t$'s residual stream at
+layer $\ell$ is
+\begin{equation}
+\Delta\hh^{\ell,\mathrm{attn}}_t
+= \sum_h \WO^{h,\ell}\!\left(\sum_{s\le t}\alpha^{\ell,h}_{t,s}\,\vv^{\ell,h}_s\right)
+= \sum_{s\le t}\F^{\ell}_{s\to t},
+\label{eq:decomp}
+\end{equation}
+where the \textbf{delivered residual contribution} from source $s$ to target $t$ is
+\begin{equation}
+\boxed{\;\F^{\ell}_{s\to t} \;=\; \sum_h \WO^{h,\ell}\!\left(\alpha^{\ell,h}_{t,s}\,\vv^{\ell,h}_s\right).\;}
+\label{eq:F}
+\end{equation}
+This is the vector actually written into $t$ by $s$ at layer $\ell$. It is exactly the per-source
+contribution of \cite{kobayashi2021incorporating} (their multi-head $\mathbf F_i(\mathbf x_j)$) and
+of \cite{ferrando2024information} (their $\alpha^h f^h(\mathbf x_j)$ with $\mathbf W_{OV}$); we
+retain it as a \emph{vector} rather than collapsing to a norm.
+
+\paragraph{LayerNorm caveat.} Equation~\eqref{eq:decomp} is exactly additive for the raw
+attention sub-block output. To account for the contribution actually deposited after the
+post-attention LayerNorm and residual add, one linearizes LayerNorm as
+$\mathrm{LN}(\sum_j \mathbf u_j)=\sum_j L(\mathbf u_j)+\bm\beta$, as in
+\cite{kobayashi2021incorporating,ferrando2022measuring}. We adopt that linearization; $\F$ then
+denotes the post-LN delivered vector and additivity holds up to the bias term $\bm\beta$.
+
+\section{Method}
+
+\subsection{Edge weights and the delivered-force graph (Construct 1)}
+
+We define a directed, strictly causal ($s<t$; self-contributions excluded) token graph with
+scalar edge weights aggregated over layers,
+\begin{equation}
+E_{s\to t} \;=\; \sum_{\ell=1}^{L}\norm{\F^{\ell}_{s\to t}}_2 ,\qquad s<t .
+\label{eq:edge}
+\end{equation}
+Sentence-level edges aggregate token edges over sentence spans $S_i,S_j$:
+\begin{equation}
+E_{i\to j} \;=\; \sum_{s\in S_i}\sum_{t\in S_j} E_{s\to t}.
+\label{eq:sentedge}
+\end{equation}
+
+\paragraph{Top-$K$ pre-pruning with an $\F$-budget.}
+Materializing all $\binom{T}{2}$ edges is $O(T^2 L H d)$. We instead keep, for each target $t$,
+only its $K$ strongest incoming sources. To avoid the failure mode of pruning by raw attention
+(which discards high-norm/low-weight tokens---precisely the case that motivates using $\F$ at
+all \cite{guo2024attention}), we prune by a cheap upper bound on the contribution norm,
+\begin{equation}
+\widehat{E}_{s\to t} \;=\; \sum_{\ell,h}\alpha^{\ell,h}_{t,s}\,\norm{\WO^{h,\ell}\vv^{\ell,h}_s}_2
+\;\ge\; \text{(per-head terms of) } E_{s\to t},
+\label{eq:budget}
+\end{equation}
+where $\norm{\WO^{h,\ell}\vv^{\ell,h}_s}$ is precomputed once per source ($O(T L H d)$ total).
+We keep $\mathcal{N}(t)=\TopK_K(\{\widehat E_{s\to t}\}_{s<t})$ and compute the exact
+Eq.~\eqref{eq:F} norm only on survivors. This is the ``$\F$-budget'': a fixed per-target edge
+budget $K$ chosen large enough not to sever genuine multi-hop relay paths.
+
+\subsection{Propagated influence via a Katz-style DP (Construct 1, cont.)}
+
+Direct edges miss \emph{indirect} influence ($s\to m\to t$). We propagate with a discounted
+recursion computed right-to-left over the DAG:
+\begin{equation}
+P_s \;=\; \sum_{t>s} E_{s\to t}\,(1+\lambda P_t),\qquad \lambda\in[0,1),
+\label{eq:katz}
+\end{equation}
+and analogously $P_i=\sum_{j>i}E_{i\to j}(1+\lambda P_j)$ at the sentence level. Eq.~\eqref{eq:katz}
+is Katz--Bonacich centrality \cite{katz1953new} on the delivered-force graph; $\lambda$ tunes the
+weight of multi-hop paths ($\lambda=0$ recovers direct out-strength). On the pruned graph the DP
+costs $O(TK)$---negligible relative to edge construction. \textbf{Top-$K$ anchor selection is
+performed on the propagated scores $P_s$, not on direct edges}, because indirect influence is a
+global property and is destroyed by pre-DP edge pruning.
+
+\subsection{Representational momentum (Construct 2)}
+
+Let $\zz_t$ be the final-layer hidden state at position $t$. Define representational
+\emph{velocity}
+\begin{equation}
+\vv_t \;=\; \zz_t - \zz_{t-1},
+\label{eq:velocity}
+\end{equation}
+a per-token \emph{stored mass} combining key-norm (addressability) and value--output norm
+(write strength),
+\begin{equation}
+M_s \;=\; \sum_{\ell,h}\norm{\kk^{\ell,h}_s}_2^2\,\norm{\WO^{h,\ell}\vv^{\ell,h}_s}_2^2 ,
+\label{eq:mass}
+\end{equation}
+and a \emph{kinematic momentum} $\pp_t = M_t\,\vv_t$. We distinguish this descriptive momentum
+from the \emph{delivered momentum} $\F_{s\to t}$ of Eq.~\eqref{eq:F}, which is causal (it is the
+actual write attributable to $s$). The proposed anchor signatures are:
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{Reinforcement / stabilizing anchor:} sustained alignment of momentum,
+$\cos(\pp_t,\pp_{t+1})\to 1$ over a window, indicating a token whose influence consistently
+pushes the trajectory in a fixed direction.
+\item \textbf{Pivot anchor:} a high-mass \emph{turn}, i.e.\ a large $\norm{\vv_t}$ accompanied by
+a sharp drop in $\cos(\vv_{t-1},\vv_t)$ (high curvature), indicating a redirection of the
+reasoning trajectory.
+\end{itemize}
+The curvature quantity here is the same one used to define ``stability'' in
+\cite{semstep2026}; the novel element is the \emph{anchor taxonomy} mapped onto reinforcement vs.\
+turn and its coupling to the mass term \eqref{eq:mass}. We treat \eqref{eq:mass} as a hypothesis,
+not a settled definition (see Risks).
+
+\paragraph{Predictive test.} As a stronger probe, we test whether momentum predicts future
+trajectory:
+\begin{equation}
+\widehat{\zz}_{t+k} \;=\; \zz_t + \beta\sum_{s\le t} P_s\,\widehat{\F}_s,\qquad
+\widehat{\F}_s = \frac{1}{\,\lvert\{t\}\rvert}\sum_{t>s}\F_{s\to t},
+\label{eq:predict}
+\end{equation}
+and whether accumulated momentum aligns with a termination direction $\zz_{\mathrm{EOS}}$
+(estimated as the mean final-layer state at end-of-thought), $\cos(\pp_t,\zz_{\mathrm{EOS}})$,
+as a candidate online stopping signal.
+
+\subsection{Online detection via running top-$K$ frequency (Construct 4)}
+
+During generation, for each new token $t$ we compute $\mathcal N(t)$ (its top-$K$ contributors)
+and increment a running counter $c_s \mathrel{+}= 1$ for every $s\in\mathcal N(t)$. Tokens with
+high accumulated $c_s$ (optionally weighted by $P_s$) are flagged as candidate anchors online.
+$c_s$ is a streaming, in-degree approximation to $P_s$. This is cheap (it reuses the same
+attribution machinery incrementally) but is a heuristic; it must be controlled for the
+\emph{position/sink confound} (recency and attention-sink tokens accumulating high counts
+without causal importance), which is the same confound flagged for receiver heads in
+\cite{bogdan2025thought}.
+
+\section{Establishing ground truth}
+\label{sec:groundtruth}
+
+Because ``anchor'' is defined by downstream causal influence, every white-box signal above must be
+validated against a ground truth. We use two.
+
+\paragraph{(A) Black-box resampling.} Following \cite{bogdan2025thought}, for each sentence $i$ we
+resample $R$ continuations ($R=100$ ideal; $R\in\{20,30\}$ for budget, see Section~\ref{sec:setup})
+from the point after $i$, and from a semantically perturbed alternative, and measure the shift in
+final-answer distribution. Large shift $\Rightarrow$ anchor. This is the gold standard and the
+dominant compute cost.
+
+\paragraph{(B) A Lyapunov / divergence score (cheaper proxy).} As an alternative ground truth
+amenable to a single TITAN, we quantify trajectory sensitivity at sentence $i$ by a finite-time
+divergence (Lyapunov-style) score: perturb the hidden state (or resample one sentence) and measure
+the exponential rate at which trajectories separate,
+\begin{equation}
+\Lambda_i \;=\; \frac{1}{\tau}\,\log\frac{\norm{\zz^{\text{pert}}_{i+\tau}-\zz_{i+\tau}}}
+{\norm{\zz^{\text{pert}}_{i}-\zz_{i}}} ,
+\label{eq:lyapunov}
+\end{equation}
+averaged over a few perturbations. High $\Lambda_i$ marks sentences where the reasoning trajectory
+is unstable/sensitive---a dynamical-systems analogue of counterfactual importance, consistent with
+the regime-switching view of \cite{statphys2025}. We will report correlation of (B) with (A) to
+calibrate it before using it as a stand-in.
+
+\section{Experimental setup}
+\label{sec:setup}
+
+\paragraph{Model and hardware.} DeepSeek-R1-Distill-Qwen-1.5B (the \cite{bogdan2025thought} small
+model; $L=28$, $H=12$, $d=1536$, $d_h=128$), fp16, single NVIDIA RTX TITAN (24\,GB).
+The 1.5B model ($\sim$3\,GB) and a 32k-token value cache ($\sim$2.7\,GB) fit comfortably; the
+attribution graph adds $\lesssim$$0.2$\,Tflop per trace, $<$1\% of generation cost and
+memory-cheap once edges are collapsed to scalars (Eq.~\eqref{eq:edge}).
+
+\paragraph{Data.} Math and logic problems with verifiable answers (e.g.\ GSM8K, MATH subset),
+matching the regimes where anchors are most pronounced \cite{bogdan2025thought}.
+
+\paragraph{Pipeline.}
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+\item Generate a CoT; hook attention weights, values, keys, $\WO$ outputs, and final-layer states.
+\item Compute ground truth: resampling (A) and/or Lyapunov (B) per sentence
+(Section~\ref{sec:groundtruth}).
+\item Build the delivered-force graph: precompute $\norm{\WO\vv}$, prune by the $\F$-budget
+Eq.~\eqref{eq:budget}, materialize exact edges Eq.~\eqref{eq:F}--\eqref{eq:edge}, run the Katz DP
+Eq.~\eqref{eq:katz} for $P_s$/$P_i$.
+\item Compute momentum signals Eqs.~\eqref{eq:velocity}--\eqref{eq:mass} and the online counter
+$c_s$.
+\item \textbf{Primary evaluation:} Spearman correlation of each white-box score
+($P_i$; momentum reinforcement/turn; $c_s$) with ground truth (A), against the
+$\rho\approx0.22$ receiver-head baseline \cite{bogdan2025thought}.
+\end{enumerate}
+
+\section{Exploratory interventions}
+\label{sec:explore}
+
+These test \emph{sufficiency} and \emph{manipulability} of anchors. All are instances of
+attention knockout / activation patching \cite{rai2024how,wang2023interpretability} and the
+attention-suppression method of \cite{bogdan2025thought}, applied at anchor granularity.
+
+\paragraph{Q1: Can one ``skip'' from one anchor to the next?}
+(\emph{a}) \emph{Speculative anchoring} on past traces: treat detected anchors as the targets a
+draft must hit, and test whether generation can leap between them. (\emph{b}) \emph{Forced
+anchoring}: mask attention \emph{from} all non-anchor sentences (retain only anchor$\to$future
+edges) and test whether a competent answer survives. Formally, replace $\alpha_{t,s}\!\leftarrow\!0$
+for $s\notin\mathcal A$ (anchor set) and renormalize; measure answer accuracy vs.\ the unmasked run.
+
+\paragraph{Q2: Are anchors sufficient? (noise-fill test)}
+Replace non-anchor sentence activations with noise (or mean-ablate, as in \cite{rai2024how}) while
+preserving anchors; if accuracy is retained, anchors are \emph{sufficient}. Conversely, filling
+\emph{anchors} with noise should sharply degrade accuracy (necessity).
+
+\paragraph{Q3: Math heads and learned algorithms.}
+On arithmetic problems, isolate the heads carrying the largest $\F$-mass into anchors and test
+whether a compact, interpretable subroutine (a ``math head'' circuit) can be identified, in the
+spirit of circuit-level CoT analyses \cite{rai2024how}.
+
+\paragraph{Q4: Anchor-gated speculative decoding.}
+Draft with the cheap model; verify spans with the expensive model; upon detecting an anchor,
+fall back to expensive single-token decoding until the anchor passes. Note this overlaps heavily
+with existing adaptive speculative decoding \cite{liao2025reward,leviathan2023fast}: the novelty,
+if any, is whether an interpretability-derived trigger beats the draft--target disagreement signal
+that speculative decoding already exploits for free. \emph{Feasibility caveat:} a genuinely large
+target may not fit alongside the draft on a 24\,GB TITAN without quantization.
+
+\section{Novelty assessment and positioning}
+
+We are explicit about what is and is not new. The summary below reflects a literature review of the
+residual-accounting, context-mixing, thought-anchor, hidden-state-dynamics, and speculative-decoding
+lines.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}p{4.4cm}p{3.2cm}p{6.4cm}@{}}
+\toprule
+\textbf{Component} & \textbf{Status} & \textbf{Closest prior art / note} \\
+\midrule
+$\F_{s\to t}$ decomposition (Eq.~\ref{eq:F}) & Established &
+\cite{kobayashi2021incorporating,ferrando2024information}; we retain the vector. \\
+Delivered-force graph + multi-hop DP (Eqs.~\ref{eq:edge},\ref{eq:katz}) & Largely preempted &
+ALTI/GlobEnc/DecompX/IFR \cite{ferrando2022measuring,modarressi2022globenc,modarressi2023decompx,ferrando2024information}; recursion is Katz \cite{katz1953new}. Open sliver: sequence-time (not layer) propagation as an \emph{anchor} score. \\
+White-box anchor detection (Construct 3) & Goal preempted &
+\cite{bogdan2025thought} already detects white-box; only a \emph{better} correlation than $\rho{\approx}0.22$ is a contribution. \\
+Momentum taxonomy: reinforce vs.\ pivot (Construct 2) & Freshest, unproven &
+Primitives (displacement/curvature) exist \cite{semstep2026,trajdyn2026,statphys2025}; taxonomy + mass coupling not seen. Mass def.\ \eqref{eq:mass} is a hypothesis. \\
+Online top-$K$ frequency detector (Construct 4) & Plausibly novel &
+Online probing exists; anchor-frequency streaming not seen. Must rule out position/sink confound. \\
+Anchor-gated speculative decoding (Q4) & Coupling plausibly novel &
+Adaptive switching is done \cite{liao2025reward}; trigger source is the only new part. \\
+Lyapunov ground-truth proxy (Eq.~\ref{eq:lyapunov}) & Plausibly novel as anchor GT &
+Dynamical-systems framings exist \cite{statphys2025}; use as anchor ground truth not seen. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The single load-bearing claim.} Constructs 2, 4, and Q4 all depend on a
+\emph{forward-looking} signal predicting a retrospectively-defined quantity. The whole program
+reduces to one falsifiable question: \emph{does a cheap, causal, forward-time signal (propagated
+delivered force, or representational momentum) predict black-box anchor importance materially
+better than the $\rho\approx0.22$ attention baseline?} If yes, the online and compute-allocation
+applications follow; if the correlation lands near $0.22$, the program has no result regardless of
+novelty. We therefore prioritize this measurement before building the intervention and decoding
+machinery.
+
+\section{Risks and limitations}
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{Predictive bet may fail.} The core correlation may not beat baseline; this is the
+primary risk and is measured first.
+\item \textbf{Mass definition is ad hoc.} Eq.~\eqref{eq:mass} multiplies addressability and write
+strength; the product form and the squaring are hypotheses. Ablate against keeping the two terms
+separate. Note key-norm sign conventions differ across the KV-eviction literature
+\cite{guo2024attention}.
+\item \textbf{Position/sink confound.} Online frequency counts may recover recency and attention
+sinks rather than anchors; requires explicit controls.
+\item \textbf{Retrospective definition vs.\ online goal.} True anchorhood is defined by the future;
+online detection necessarily predicts it from partial evidence.
+\item \textbf{Fast-moving field.} The hidden-state-dynamics literature is producing results
+monthly; novelty of Constructs 2/4 should be re-verified immediately before submission.
+\end{itemize}
+
+\begin{thebibliography}{99}
+\small
+\bibitem{bogdan2025thought} P.~C. Bogdan, U.~Macar, N.~Nanda, A.~Conmy.
+\emph{Thought Anchors: Which LLM Reasoning Steps Matter?} arXiv:2506.19143, 2025.
+\bibitem{kobayashi2020attention} G.~Kobayashi, T.~Kuribayashi, S.~Yokoi, K.~Inui.
+\emph{Attention is Not Only a Weight: Analyzing Transformers with Vector Norms.} EMNLP 2020.
+\bibitem{kobayashi2021incorporating} G.~Kobayashi, T.~Kuribayashi, S.~Yokoi, K.~Inui.
+\emph{Incorporating Residual and Normalization Layers into Analysis of Self-Attention.} EMNLP 2021.
+\bibitem{elhage2021mathematical} N.~Elhage et al.
+\emph{A Mathematical Framework for Transformer Circuits.} Transformer Circuits Thread, 2021.
+\bibitem{ferrando2022measuring} J.~Ferrando, G.~I. G\'allego, M.~R. Costa-juss\`a.
+\emph{Measuring the Mixing of Contextual Information in the Transformer (ALTI).} EMNLP 2022.
+\bibitem{modarressi2022globenc} A.~Modarressi et al.
+\emph{GlobEnc: Quantifying Global Token Attribution by Incorporating the Whole Encoder Layer.} NAACL 2022.
+\bibitem{modarressi2023decompx} A.~Modarressi et al.
+\emph{DecompX: Explaining Transformers Decisions by Propagating Token Decomposition.} ACL 2023.
+\bibitem{ferrando2024information} J.~Ferrando, E.~Voita.
+\emph{Information Flow Routes: Automatically Interpreting Language Models at Scale.} EMNLP 2024. arXiv:2403.00824.
+\bibitem{abnar2020quantifying} S.~Abnar, W.~Zuidema.
+\emph{Quantifying Attention Flow in Transformers.} ACL 2020.
+\bibitem{katz1953new} L.~Katz.
+\emph{A New Status Index Derived from Sociometric Analysis.} Psychometrika 18(1), 1953.
+\bibitem{guo2024attention} Z.~Guo et al.
+\emph{Attention Score is Not All You Need (Value-Aware Token Pruning).} EMNLP 2024.
+\bibitem{statphys2025} \emph{A Statistical Physics of Language Model Reasoning.} arXiv:2506.04374, 2025.
+\bibitem{trajdyn2026} \emph{Trajectory Dynamics in Language-Model Hidden States.} arXiv:2606.05346, 2026 (verify).
+\bibitem{semstep2026} \emph{Semantic Step Prediction / Progress and Stability Decomposition.} arXiv:2604.18464, 2026 (verify).
+\bibitem{steering2025} \emph{Understanding and Steering the Cognitive Behaviors of Reasoning Models at Test-Time.} arXiv:2512.24574, 2025.
+\bibitem{meng2022locating} K.~Meng, D.~Bau, A.~Andonian, Y.~Belinkov.
+\emph{Locating and Editing Factual Associations in GPT (ROME / causal tracing).} NeurIPS 2022.
+\bibitem{wang2023interpretability} K.~Wang, A.~Variengien, A.~Conmy, B.~Shlegeris, J.~Steinhardt.
+\emph{Interpretability in the Wild: a Circuit for Indirect Object Identification (path patching).} ICLR 2023.
+\bibitem{rai2024how} D.~Rai, Z.~Yao.
+\emph{How to think step-by-step: A mechanistic understanding of chain-of-thought reasoning.} arXiv:2402.18312, 2024.
+\bibitem{leviathan2023fast} Y.~Leviathan, M.~Kalman, Y.~Matias.
+\emph{Fast Inference from Transformers via Speculative Decoding.} ICML 2023.
+\bibitem{li2024eagle} Y.~Li et al.
+\emph{EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty.} ICML 2024.
+\bibitem{liao2025reward} B.~Liao et al.
+\emph{Reward-Guided Speculative Decoding for Efficient LLM Reasoning.} arXiv:2501.19324, 2025.
+\end{thebibliography}
+
+\end{document}

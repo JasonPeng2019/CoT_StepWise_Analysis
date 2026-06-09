@@ -1,0 +1,27 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments
+.venv/
+
+# HuggingFace model cache (3.4 GB — DeepSeek-R1-Distill-Qwen-1.5B weights)
+data/cache/
+
+# Raw datasets (reproducible from HuggingFace)
+data/raw/
+
+# Experiment outputs
+artifacts/
+
+# Model weights safety net (in case they end up outside data/cache)
+*.safetensors
+*.bin
+
+# Secrets
+.env
+
+# OS metadata
+.DS_Store
+Thumbs.db

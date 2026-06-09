@@ -1,0 +1,43 @@
+experiment:
+  name: phase0_babi
+  phase: 0
+  tier: foundation
+  global_seed: 17
+
+model:
+  name_or_path: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+  dtype: float16
+  attn_impl_eager: eager
+  attn_impl_fast: sdpa
+
+phase0:
+  dataset: babi
+  task_ids: [1, 2, 3, 4, 5]
+  max_examples_per_task: 5
+  split_name: train
+
+generation:
+  temperature: 0.6
+  max_new_tokens: 256
+  stop_strings: ["\nQuestion:", "\nQ:"]
+
+segmentation:
+  window_tokens: 24
+  clause_connectives: ["so", "therefore", "thus", "then", "next", "because"]
+
+signals:
+  pruning_top_k: 16
+  lambda: 0.5
+  mlp_band_layers: [12, 13, 14, 15, 16]
+
+labels:
+  rollout_metric: tv
+  real_rollouts: 10
+  diff_rollouts_target: 10
+  oversample_factor: 4
+  semantic_tau: 0.8
+
+paths:
+  artifacts_root: artifacts
+  raw_data_root: data/raw
+  cache_root: data/cache

@@ -1,0 +1,735 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{titlesec}
+\usepackage[expansion=false]{microtype}
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!40!black}
+
+\titleformat{\section}{\large\bfseries}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.6em}{}
+
+\newcommand{\F}{\mathbf{F}}
+\newcommand{\WO}{\mathbf{W}_O}
+\newcommand{\WV}{\mathbf{W}_V}
+\newcommand{\WOV}{\mathbf{W}_{OV}}
+\newcommand{\vv}{\mathbf{v}}
+\newcommand{\kk}{\mathbf{k}}
+\newcommand{\hh}{\mathbf{h}}
+\newcommand{\zz}{\mathbf{z}}
+\newcommand{\xx}{\mathbf{x}}
+\newcommand{\Jac}{\mathbf{J}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\TopK}{\mathrm{TopK}}
+\newcommand{\MLP}{\mathrm{MLP}}
+\newcommand{\Span}{\mathcal S}
+
+\title{\textbf{Forward-Time Detection of Thought Anchors: \\ Run-Ready Experimental Protocol}\\[0.4em]
+\large Data Generation, Signals, Trials, and Causal Follow-ups}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+Thought anchors are reasoning spans that disproportionately steer a chain of thought (CoT),
+defined operationally by counterfactual resampling importance \cite{bogdan2025thought}. The only
+published white-box predictor (a receiver-head attention signal) tracks that ground truth weakly
+($\rho\approx0.22$). This protocol asks one falsifiable question: \emph{does a cheap, forward-time
+signal predict resampling importance materially better than $0.22$?} The central bet is that the
+answer needs a signal orthogonal to attention routing---a measure of where the model
+\emph{computes} (MLP write-magnitude), not only where it \emph{routes} (delivered attention force).
+We specify (i) a data-generation pipeline producing resampling labels at
+\emph{clause-respecting window} granularity on parallel GPUs; (ii) a reasoning-difficulty dataset curriculum; (iii) the residual
+accounting and Katz-propagation machinery with formulas and provenance; (iv) the full signal set,
+including the math justifying gradient-scaled attribution; (v) five trials, from single-signal
+marginals to interpretable and nonlinear combiners; and (vi) causal interventions Q1--Q4 run as
+follow-ups. Execution is staged into escalating tiers---cheapest, most-likely-to-succeed marginals
+first, with fix or improvement features added per result, and the dominant labeling cost gated behind
+cheaper checks. Target model: DeepSeek-R1-Distill-Qwen-1.5B; budget: $8\times$A100, $\sim$4--5 days,
+sufficient to label at the gold ($R{=}100$) resampling level.
+\end{abstract}
+
+\section{The load-bearing claim}
+Every signal is a cheap forward-pass quantity; the target (resampling importance) is a
+counterfactual-on-the-text quantity. A span can be important only if its content (a) \emph{reaches}
+the answer-producing computation and (b) the answer actually \emph{depends} on it. Forward-pass
+signals measure the \emph{capacity} for importance; resampling measures \emph{realized} importance.
+The gap---redundancy, robustness, nonlinearity---caps achievable correlation below~1 and is
+unknowable from the forward pass. Whether the ceiling sits above $0.22$ is the empirical question,
+measured \emph{first}, before any combiner is built.
+
+\section{Staged execution: experiment tiers}
+\label{sec:tiers}
+Everything in this protocol is something we intend to try \emph{eventually}; none of it is meant to run
+at once. Execution is \emph{tiered and escalating}: begin with the smallest run that is plausibly
+sufficient, and add machinery only as evidence demands. After each tier the path forks---\emph{fix}
+features if the tier underperformed, \emph{improvement} features if it succeeded---and we climb until
+either every necessary tier has run and none beats the $0.22$ baseline (a clean negative result), or the
+working signal has every upgrade it supports. This section changes no concept, definition, or
+experiment; it only fixes the order in which they are exercised.
+
+\paragraph{Foundation (present in \emph{every} tier---correctness, not features).}
+The architecture-correct extraction and the label pipeline are prerequisites, never optional, and are
+what ``critical failure points still carry their fix'' refers to: pre-norm/RMSNorm additivity and GQA
+head mapping (\S\ref{sec:background}), eager-attention $\alpha$ capture, contribution-based top-$K$
+pruning ($\widehat E$), and the per-position local backward for any gradient feature
+(\S\ref{sec:gradmath}); clause-respecting spans (\S\ref{sec:granularity}) and resample-and-filter
+labels $A$ (\S\ref{sec:data}; \cite{bogdan2025thought}), scored on Phase~0--1 with the bAbI supporting-fact construct
+check (\S\ref{sec:curriculum}). These hold from Tier~1 onward regardless of results.
+
+\paragraph{Tier 0 --- warm-up and cost gates (run before committing the gold-labeling budget).}
+The Tier-1 \emph{signals} are nearly free, but the $R{=}100$ resample-and-filter labeling they are
+scored against is the dominant cost of the project---so it is gated behind cheaper checks, climbed in
+order and aborting early if one fails:
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+\item \textbf{Reuse check (free).} If \cite{bogdan2025thought}'s released resampling dataset covers the
+target model, take their gold labels directly---zero labeling cost and an exact $0.22$ comparison.
+\item \textbf{bAbI construct check (free, no resampling).} Extract the Tier-1 signals on bAbI traces and
+test whether they rank the annotated supporting facts above distractors. The cheapest science gate: if
+the signals cannot track on-path facts on the easiest dataset, the labeling budget is likely wasted.
+It is a fail-fast \emph{leading indicator}, not a strict gate---supporting-facts is a coarser label
+than resampling importance, so passing does not guarantee beating $0.22$ and failing is a strong
+warning rather than a proof.
+\item \textbf{Small-$R$ pilot.} A low-$R$ ($\approx$10--20) batch on a problem subset gives a noisy
+early read on $\rho$ against (A) and doubles as the $t$/$K$/band-$\mathcal B$ localization Phase~0
+already requires; abort before full labeling if even the noisy pilot shows nothing.
+\item \textbf{Full $R{=}100$ gold labeling}---only after the cheaper gates pass.
+\end{enumerate}
+Only once gold labels exist does the Tier-1 decision below apply.
+
+\paragraph{Tier 1 --- minimal marginals (the fulcrum; the run most likely to succeed).}
+The cheapest forward-only single-signal marginals---no backward pass, no chaining, no combiner:
+propagated routing $P_i$ (Eq.~\ref{eq:katz}; Trial~1, the closest analogue to prior white-box work and
+the first thing that must clear $0.22$), own computation $G_i$ (Eq.~\ref{eq:G}; Trial~2, the orthogonal
+thesis), and crude one-hop computation-weighted outflow $P'_i$ (Eq.~\ref{eq:Pprime}; Trial~4 without the
+gradient). \emph{Decision (two-pronged, matching the central bet):} (i) does any marginal beat $0.22$
+against (A)---is there exploitable forward signal at all; and (ii) does the computation axis ($G_i$ or
+$P'_i$) beat or add over routing ($P_i$)---the test of the thesis itself, since a win carried by $P_i$
+alone is only a cleaner \emph{routing} result, not evidence that computation carries orthogonal signal.
+
+\paragraph{Tier 2 --- the first fork.}
+\emph{Thesis supported (both prongs clear):} add the gradient-scaled outflow $D_i$ (Eq.~\ref{eq:grad};
+Trial~3) for principled credit assignment over crude $P'$---its payoff over $P'$ being the
+Trial~3-vs-4 test, not assumed---and the interpretable linear combiner (Trial~5, ridge / PCR), keeping
+the computation signal only if it adds over $P_i{+}G_i$; the coefficients are the finding.
+\emph{Routing clears $0.22$ but the computation axis does not, or signals are position-dominated (fix):}
+a one-hop computation null has three escapes to rule out before declaring the axis inert---a position
+confound (add residualization against the position-only null); a bad first-order approximation
+(substitute the faithful $D^{\mathrm{IG}}$, Eq.~\ref{eq:ig}); or \emph{wrong reach}---the axis may carry
+signal only \emph{transitively}, so the chained variant (Eq.~\ref{eq:chained}, otherwise a Tier-3
+improvement) is pulled forward here as a rescue, since the design's own expectation is that the
+computation signal may live in the multi-hop form. Only after these does a clean routing-only result
+stand (still publishable, but not the bet).
+
+\paragraph{Tier 3 --- reach and ceiling (improvement) / blow-up control (fix).}
+Add the chained variants $\widetilde P'_i,\widetilde D_i$ (Eq.~\ref{eq:chained}) with the $\lambda$
+sweep---the reach sub-analyses of Trials~3--4, testing whether computational influence is
+transitive---and the nonlinear MLP combiner (Trial~5(ii)) as an accuracy ceiling reported beside the
+interpretable model. The chained signals carry the blow-up risk; if they underperform or turn
+position-dominated, this tier's fix branch is the remediation ladder (\S\ref{sec:contingency}).
+
+\paragraph{Tier 4 --- causal validation (only once a detector tracks anchors).}
+Convert correlation into causation with the interventions (\S\ref{sec:followups}): Q2 noise-fill
+(sufficiency/necessity, the most convincing) first, then Q1 (forced/speculative anchoring), Q3
+(math/state heads), and the targeted DecompX probe on confirmed anchors. Q4 stays demoted.
+
+\paragraph{Tier 5 --- best-possible version (scale-up on a validated detector).}
+Extend across the full curriculum (Phases~2--4 through SCONE), add the GSM8K out-of-distribution
+generalization test, and calibrate the Lyapunov proxy (B) against (A) to scale labeling
+(\S\ref{sec:groundtruth}). This is the upper end: all upgrades to the working form.
+
+\paragraph{Termination.} Stop when either every necessary tier has run and none beats $0.22$ (the
+central bet is falsified---a clean negative result), or the working signal has received every upgrade it
+supports and the next tier's marginal gain no longer justifies its cost.
+
+\section{Background and technique provenance}
+\label{sec:background}
+\paragraph{Residual stream (additive view) \cite{elhage2021mathematical}.}
+Every component writes additively into a shared residual stream; attention heads act independently.
+Because attention is linear in the value vectors once weights are fixed, the attention update at
+layer $\ell$, head $h$ decomposes by source token.
+
+\paragraph{Per-source delivered force \cite{kobayashi2020attention,kobayashi2021incorporating}.}
+Attention weight alone misstates information flow: a high-weight token with small transformed-value
+norm contributes little. Folding in the output projection, the delivered residual contribution from
+source $s$ to target $t$ is
+\begin{equation}
+\F^{\ell}_{s\to t}=\sum_h \WO^{h,\ell}\!\left(\alpha^{\ell,h}_{t,s}\,\vv^{\ell,h}_s\right),
+\qquad
+\Delta^{\ell,\mathrm{attn}}_t=\sum_{s\le t}\F^{\ell}_{s\to t}.
+\label{eq:F}
+\end{equation}
+
+\paragraph{Architecture note: pre-norm RMSNorm and GQA (not the post-LN/MHA setting).}
+The original residual-accounting work \cite{kobayashi2021incorporating} targets \emph{post-norm}
+LayerNorm transformers, where one linearizes the post-attention LayerNorm to recover additivity (the
+``post-LN delivered vector, additive up to a bias $\beta$''). Our target model is \emph{pre-norm} with
+RMSNorm, which changes this in two ways we adopt throughout:
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{No post-attention norm $\Rightarrow$ exact additivity, no bias.} In a pre-norm block,
+$\hh'=\hh+\WO(\mathrm{attn}(\mathrm{RMSNorm}(\hh)))$: the attention output is written into the residual
+\emph{with no normalization after it}. So $\F^{\ell}_{s\to t}$ is \emph{exactly} additive into the
+residual (Eq.~\ref{eq:F} holds with no bias term and no linearization needed for the edge
+$E_{s\to t}$). RMSNorm enters only when a \emph{downstream} block reads the residual; for the gradient
+feature (\S\ref{sec:gradmath}) that read-norm is differentiated through automatically, and if the
+chained routing graph ever needs it explicitly, the linearization is $L(u)=\mathrm{diag}(\gamma/\mathrm{rms}(\hh'))\,u$
+with the denominator frozen at the operating point---\emph{no bias}, unlike LayerNorm.
+\item \textbf{Grouped-query attention.} The model has $H$ query heads but fewer KV heads; query head
+$h$ shares the value $\vv^{kv(h)}_s$ of its group's KV head. Eq.~\eqref{eq:F} must use $\alpha^{h}$ per
+query head with $\vv^{kv(h)}$ from the shared KV head, and $\WO^{h}$ the query-head output block;
+treating the heads as fully independent mis-attributes $\F$.
+\end{itemize}
+Information Flow Routes \cite{ferrando2024information} carry the per-source construction to
+decoder-only LLMs, folding $\WOV=\WV\WO$ into per-(source,head) contributions; we retain the vector
+rather than collapsing to a norm prematurely.
+
+\paragraph{Scalar edges and span aggregation.}
+\begin{equation}
+E_{s\to t}=\sum_{\ell=1}^{L}\norm{\F^{\ell}_{s\to t}}_2,
+\qquad
+E_{i\to j}=\sum_{s\in\Span_i}\sum_{t\in\Span_j}E_{s\to t},
+\label{eq:edge}
+\end{equation}
+where $\Span_i,\Span_j$ are token spans (\S\ref{sec:granularity}). To avoid materializing all
+$O(T^2)$ edges, prune per target to a top-$K$ in-set $\mathcal N(t)$ using a cheap contribution-norm
+upper bound $\widehat E_{s\to t}=\sum_{\ell,h}\alpha^{\ell,h}_{t,s}\norm{\WO^{h,\ell}\vv^{\ell,h}_s}_2$
+(precomputed once per source, $O(TLHd)$); compute exact \eqref{eq:F} norms only on survivors. This
+prunes by contribution rather than raw attention, the failure mode \cite{guo2024attention} flags.
+
+\paragraph{Multi-hop propagation: a Katz-style DP \cite{katz1953new}.}
+Direct edges miss indirect influence $s\!\to\!m\!\to\!t$. Propagate with a discounted right-to-left
+recursion on the causal DAG:
+\begin{equation}
+P_s=\sum_{t>s}E_{s\to t}\,(1+\lambda P_t),\qquad \lambda\in[0,1),
+\label{eq:katz}
+\end{equation}
+and analogously $P_i=\sum_{j>i}E_{i\to j}(1+\lambda P_j)$ at span level. Equation~\eqref{eq:katz} is
+Katz--Bonacich centrality on the delivered-force graph; $\lambda$ tunes multi-hop weight
+($\lambda{=}0$ recovers direct out-strength). On the pruned graph the DP costs $O(TK)$.
+
+\emph{The recursion is the full chain.} Unfolding \eqref{eq:katz} shows it is the efficient form of a
+discounted sum over \emph{every} directed path leaving $s$:
+\begin{equation}
+P_s=\underbrace{\sum_{t}E_{s\to t}}_{\text{1-hop}}
+\;+\;\lambda\underbrace{\sum_{t,u}E_{s\to t}E_{t\to u}}_{\text{2-hop }s\to t\to u}
+\;+\;\lambda^2\!\!\underbrace{\sum_{t,u,v}E_{s\to t}E_{t\to u}E_{u\to v}}_{\text{3-hop}}+\cdots
+=\sum_{k\ge0}\lambda^{k}\!\!\sum_{\substack{\text{paths }s\to\cdots\\ \text{length }k+1}}\;\prod_{\text{edges}}E_{\cdot\to\cdot}.
+\label{eq:pathsum}
+\end{equation}
+So node$\to$node$\to$node$\to\cdots$ influence of all lengths is captured, each path geometrically
+discounted by $\lambda$ per hop. Because the graph is a strict DAG ($s<t$), the adjacency matrix is
+nilpotent: the sum terminates at path length $T$, so $\lambda\in[0,1)$ is safe with no convergence
+condition (unlike Katz on a general graph, which requires $\lambda<1/\rho(E)$).
+
+\emph{Pruning can truncate the chain---a caveat with two consequences.} The top-$K$ in-set
+$\mathcal N(t)$ is applied \emph{before} propagation, so a weak direct edge $s\to m$ that is pruned
+severs the relay $s\to m\to u$ even when $m\to u$ is strong. Two safeguards follow. (1) $K$ (the
+``$\F$-budget'') must be set large enough not to cut genuine relay edges; we calibrate $K$ in Phase~0
+by checking that increasing it no longer changes the ranking of $P$. (2) Anchor selection is performed
+on the \emph{propagated} scores $P_i$, never on direct edges $E_{i\to j}$, because indirect influence
+is a global property destroyed by pre-DP pruning. The chain in \eqref{eq:pathsum} is therefore only as
+complete as the retained edge set, and reported $\rho$ should be checked for stability under $K$.
+
+\paragraph{Why not propagate through the MLP.}
+Folding the MLP into the graph---linearizing the activation and propagating decomposed vectors---is
+DecompX \cite{modarressi2023decompx}. Trace-wide it costs $O(T^2Ld\,d_{\mathrm{ff}})$ and exceeds the
+memory budget at long contexts; even top-$K$-pruned it is a $K\times$ multiplier on the heaviest
+block. We therefore treat the MLP position-wise (\S\ref{sec:signals}) and reserve pruned DecompX as a
+\emph{post-hoc} probe on confirmed anchors only (\S\ref{sec:followups}).
+
+\section{Signal palette}
+\label{sec:signals}
+Signals score a candidate anchor as a \emph{source} span $i$. The unit of analysis is the token span
+$\Span_i$ (\S\ref{sec:granularity}); all per-token quantities aggregate over spans as in
+\eqref{eq:edge}.
+
+\paragraph{Routing.}
+$E_i$ (direct out-strength, $\lambda{=}0$) and $P_i$ (Eq.~\ref{eq:katz}, propagated). Comparing them
+isolates whether indirect influence matters.
+
+\paragraph{Computation (orthogonal axis).}
+Attention \emph{moves} information between positions; the MLP \emph{transforms} it in place. We read
+the position-wise MLP write-magnitude, per-layer normalized (removing depth-driven norm growth) and
+aggregated over an empirically localized band $\mathcal B$ (Phase~0):
+\begin{equation}
+G_t=\sum_{\ell\in\mathcal B}\frac{\norm{\MLP_\ell(\tilde\hh^{\ell}_t)}_2}{\sigma_\ell},
+\qquad G_i=\sum_{t\in\Span_i}G_t,
+\label{eq:G}
+\end{equation}
+with $\sigma_\ell$ the cross-position std at layer $\ell$. Here $\tilde\hh^{\ell}_t=\mathrm{RMSNorm}(\hh'^{\ell}_t)$
+is the post-attention-norm MLP input; in pre-norm $\norm{\MLP_\ell}$ is the \emph{net} residual write
+(the MLP output is added directly, no post-MLP norm), and \S\ref{sec:gradmath} differentiates this same
+quantity w.r.t.\ the residual $\hh'$ with the RMSNorm in the autodiff path. $G$ is read off the same
+forward pass at $O(T|\mathcal B|)$ cost.
+
+\paragraph{Flow-into-computation (two forms $\times$ two reaches).}
+\emph{Crude (computation-weighted outflow), one-hop:}
+\begin{equation}
+P'_i=\sum_{j>i}E_{i\to j}\,g(G_j),\qquad g\in\{\mathrm{id},\log,\text{threshold}\},
+\label{eq:Pprime}
+\end{equation}
+which credits $i$ with all of $G_j$ regardless of whether $i$ drove it.
+\emph{Gradient-scaled outflow} $D_i$ (defined and justified in \S\ref{sec:gradmath}) credits $i$ with
+the first-order share of $G_j$ that responds to $i$'s specific inflow.
+
+Both \eqref{eq:Pprime} and $D_i$ as written are \emph{one-hop}: they weight only $i$'s direct edges by
+the computation they land in, and so do \emph{not} chain ``$i$ feeds $j$, whose result feeds $k$'s
+computation.'' If computational influence is transitive through the reasoning---an anchor sets up a
+fact used in a later computation that itself feeds an even later one---the natural multi-hop analogue
+folds the computation weight into the Katz recursion:
+\begin{equation}
+\widetilde P'_i=\sum_{j>i}E_{i\to j}\,g(G_j)\,(1+\lambda\widetilde P'_j),
+\qquad
+\widetilde D_i=\sum_{j>i}D_{i\to j}\,(1+\lambda\widetilde D_j),
+\label{eq:chained}
+\end{equation}
+which unfold (cf.\ Eq.~\ref{eq:pathsum}) to $\sum_k\lambda^k\sum_{\text{paths}}\prod E_{\cdot\to\cdot}\,g(G_\cdot)$,
+i.e.\ paths in which \emph{every} node is weighted by its computation. Eqs.~\eqref{eq:Pprime}/$D_i$ are
+the $\lambda{=}0$ truncation of \eqref{eq:chained}. One-hop vs.\ chained is exactly the $E$-vs-$P$
+(direct-vs-propagated) comparison applied to the computation axis, and is tested as such in Trials~3--4.
+
+\paragraph{Online and confounds.}
+$c_i$ (streaming in-degree: increment for every $i$ appearing in some target's $\mathcal N(t)$ during
+generation; an inline approximation to $P_i$); position and span length (confound baselines);
+momentum (velocity/curvature) \emph{demoted} to a completeness check.
+
+\paragraph{Mechanistic reading.} The palette spans two anchor species: \emph{premise anchors} (state
+content that propagates: high routing, low local computation) and \emph{decision anchors} (perform
+the load-bearing operation: high computation). $P_i$ targets the first, $G_i$ the second, $D_i/P'_i$
+their intersection.
+
+\section{Gradient-scaled attribution: why, and the math}
+\label{sec:gradmath}
+We want the contribution of source $i$'s outflow to a downstream target's computation. The MLP is a
+\emph{fixed, known, differentiable} function, so we differentiate it rather than re-learn it. Write
+the pre-MLP residual at target $t$ as $\hh'_t=\hh^{\text{pre}}_t+\sum_{s}\F_{s\to t}$ (the inflow adds
+into it). The downstream computation magnitude is $G_t=\norm{\MLP(\hh'_t)}$. A first-order (Taylor)
+expansion around removing $s$'s inflow gives
+\begin{equation}
+G_t(\hh'_t)\;\approx\;G_t\!\big(\hh'_t-\F_{s\to t}\big)\;+\;\underbrace{\nabla_{\hh'_t}G_t\cdot\F_{s\to t}}_{\text{marginal contribution of }s},
+\label{eq:taylor}
+\end{equation}
+so the contribution of $s$'s inflow to $t$'s computation is the directional derivative
+$\nabla_{\hh'_t}G_t\cdot\F_{s\to t}$, obtained by one vector--Jacobian product:
+\begin{equation}
+\nabla_{\hh'_t}G_t=\frac{\MLP(\hh'_t)}{\norm{\MLP(\hh'_t)}}\,\Jac_{\MLP}(\hh'_t),
+\qquad
+D_{s\to t}=\big(\nabla_{\hh'_t}G_t\big)\cdot\F_{s\to t},
+\qquad
+D_i=\sum_{j>i}\sum_{\substack{s\in\Span_i,\,t\in\Span_j}}D_{s\to t}.
+\label{eq:grad}
+\end{equation}
+
+\paragraph{Per-layer, local Jacobians.} Eq.~\eqref{eq:grad} is written at a single level for clarity,
+but $G_t$ aggregates MLP writes over the band $\mathcal B$, so the operative form is per-layer,
+$D_{s\to t}=\sum_{\ell\in\mathcal B}\big(\nabla_{\hh'^{\ell}_t}\norm{\MLP_\ell}/\sigma_\ell\big)\cdot\F^{\ell}_{s\to t}$,
+where each gradient is the \emph{local} Jacobian of layer $\ell$'s MLP w.r.t.\ \emph{its own} pre-MLP
+input---the input is treated as a detached leaf so the gradient does not flow back through the residual
+stream into earlier layers (we want layer $\ell$'s in-place sensitivity, not a full-network gradient).
+Because the MLP is position-wise ($\partial G_t/\partial \hh'_\tau=0$ for $\tau\neq t$), all positions'
+gradients are recovered in a single backward pass per layer by back-propagating the summed per-position
+norm; the cost is $|\mathcal B|$ local backward passes, each vectorized over positions.
+
+\paragraph{Provenance.} Equation~\eqref{eq:grad} is not new machinery; it is the established
+gradient$\times$input / attribution-patching operator, applied to a new metric. The operator
+$\nabla F(x)\cdot x$ originates as \emph{gradient$\times$input} \cite{shrikumar2017learning}, introduced
+for input-feature saliency, where multiplying the gradient by the input sharpens attributions and
+partly mitigates the vanishing-gradient problem of raw gradients; it is provably equivalent to
+$\epsilon$-LRP and DeepLIFT for ReLU networks with a zero baseline \cite{ancona2018towards}. The same
+first-order operator was carried into mechanistic interpretability as \emph{(edge) attribution
+patching}: Nanda (2023) and \cite{syed2023attribution} use $x_e\,\partial \mathcal L/\partial x_e$ as a
+linear approximation of the effect of patching a component, to discover task circuits---and report it
+\emph{outperformed} the prior automated method (ACDC) in circuit-recovery AUC while needing only two
+forward passes and one backward pass. Our $D_{s\to t}$ is exactly this operator with one substitution:
+the metric is not the output loss but the \emph{downstream MLP-write magnitude} $G_t$, and the
+perturbation is the delivered force $\F_{s\to t}$. So we inherit a validated, cheap estimator and apply
+it to attribute \emph{computation} (the routing-vs-computation axis) rather than loss---the metric
+choice is the only new element, and should be verified against the circuit-attribution literature
+before being claimed as such.
+
+\paragraph{Why gradient-scaled over crude $P'$.}
+$P'$ (Eq.~\ref{eq:Pprime}) credits $i$ with the \emph{total} downstream computation $G_j$, even when
+$i$'s specific contribution is irrelevant and some other inflow drives the MLP. The gradient credits
+only the component of $G_t$ that \emph{responds} to $i$'s actual contribution direction, and---because
+$\nabla G_t$ is evaluated at the true $\hh'_t$---it is \emph{context-aware}: it already accounts for
+every other inflow present. Under local near-linearity $D_{s\to t}\!\approx\!c\,\norm{\F_{s\to t}}$ and
+$D_i$ coincides with $P'_i$; they diverge exactly where the MLP is nonlinear or the gradient direction
+misaligns with $\F_{s\to t}$, so the $D$-vs-$P'$ gap is itself a measure of how much nonlinear credit
+assignment matters.
+
+\paragraph{First-order caveat and faithful fallback.}
+Equation~\eqref{eq:grad} is first-order; under activation saturation the local gradient understates a
+finite contribution---the zero-gradient failure that affects gradient$\times$input and attribution
+patching alike. The fix is the same one the attribution literature adopted: \emph{integrated
+gradients} \cite{sundararajan2017axiomatic}, which accumulates the gradient along a path from a
+baseline to the actual input and is theoretically grounded by a completeness axiom, restoring
+faithfulness where the single local derivative fails. Applied to edge attribution this is
+\emph{EAP-IG} \cite{hanna2024faith}, which \cite{hanna2024faith} showed recovers more faithful circuits
+than vanilla EAP precisely by removing the zero-gradient pathology. Our completeness-respecting variant
+is the direct analogue:
+\begin{equation}
+D^{\mathrm{IG}}_{s\to t}=\Big(\textstyle\int_0^1 \nabla_{\hh'}G_t\big(\hh'_t-(1-\alpha)\,\F_{s\to t}\big)\,d\alpha\Big)\cdot\F_{s\to t}.
+\label{eq:ig}
+\end{equation}
+Exact ablation $G_t(\hh'_t)-G_t(\hh'_t-\F_{s\to t})$ is the faithful-but-costly endpoint, reserved for
+confirmed anchors (all three share the baseline $\hh'_t-\F_{s\to t}$: full input minus only $s$'s inflow,
+other inflows present). The ladder $P'\!\to D\!\to D^{\mathrm{IG}}$ mirrors crude$\,\to$EAP$\,\to$EAP-IG and
+is climbed only if the cheaper rung fails to beat baseline. One mitigating point in our favor: EAP is
+known to capture the \emph{ordering} of edges better than their absolute effects \cite{hanna2024faith};
+since we evaluate by Spearman rank correlation, the first-order approximation's main weakness (poor
+absolute values) is largely irrelevant to anchor \emph{ranking}.
+
+\section{Data generation}
+\label{sec:data}
+
+\subsection{Model and hardware}
+Target: DeepSeek-R1-Distill-Qwen-1.5B ($L{=}28$, $H{=}12$, $d{=}1536$, $d_h{=}128$), fp16. All phases
+use the \emph{same} model so that resampling labels and forward-pass signals remain commensurable;
+cross-model transfer is a separate study (see Risks). Hardware: $8\times$A100. With batched generation
+($\sim$10$^{9.5\pm0.3}$ generated tokens over 4--5 days) the budget supports gold-level $R{=}100$
+resampling across diverse problems; the attribution graph adds $<1\%$ once edges collapse to scalars.
+
+\subsection{Granularity: clause-respecting windows}
+\label{sec:granularity}
+Small CoT models emit short traces, so sentence units yield too few labels per trace and coarse
+localization; but a fixed token window cutting across clause boundaries would split a single semantic
+unit, making a span an incoherent thing to resample or substitute (\S\ref{sec:data}). We therefore use a
+\emph{two-stage, boundary-first} segmentation, so windows are nested \emph{inside} linguistic units and
+never straddle a break:
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+\item \textbf{Parse boundaries first.} Segment the trace into clauses by splitting at sentence
+terminators, newlines, comma-delimited clause boundaries, and reasoning/discourse connectives
+(\textit{so, therefore, thus, then, next, because}). Each resulting unit is one clause.
+\item \textbf{Window within a clause.} A clause of $\le t$ tokens is one span. A longer clause is
+subdivided into consecutive $t$-token windows (the final remainder merged with the previous window if
+shorter than $t/2$). Windows are never formed across a clause boundary.
+\end{enumerate}
+The framework is granularity-agnostic (\eqref{eq:edge},\eqref{eq:G} aggregate over arbitrary spans);
+only the span definition changes. We sweep $t\in\{10,15,25\}$ in Phase~0 and pick the granularity at
+which span-level resampling labels are most stable. Because the resample-and-filter label
+(\S\ref{sec:data}) and its semantic filter were designed at the \emph{sentence} level, this sweep must
+also confirm the method \emph{transfers} to sub-sentence windows---that semantically-different
+resamples of a short span are obtainable and the filter calibrates sensibly; if fine windows do not
+support stable filtered resampling, fall back to sentence granularity, which also aligns with reusing
+their sentence-level dataset. Perturbation operates on the whole span, which is
+now always a clause or a within-clause window---a coherent unit to perturb.
+
+\subsection{Resampling labels (parallel rollouts)}
+For span $i$ in a base trace, importance is the counterfactual dependence of the answer on $i$'s
+content \cite{bogdan2025thought}. We adopt the method of \cite{bogdan2025thought} as the gold label---
+both because it is the published benchmark our $0.22$ target was measured against (changing the label
+would make that comparison apples-to-oranges) and because its counterfactuals stay in-distribution.
+
+\paragraph{Primary: resample-and-filter \cite{bogdan2025thought}.} Resample $R$ replacement spans for
+$i$ \emph{from the model itself} (continuing from the prefix up to the start of $i$), filter for the
+semantically \emph{different} ones, continue the chain of thought to the answer from each, and compare
+the final-answer distribution against continuations of the unperturbed (``real'') prefix. The semantic
+filter \emph{is} the similar-vs-different split: replacements that merely paraphrase $i$ are the
+implicit control (they should not move the answer), and importance is read off the
+semantically-different replacements---so no separate constructed contrast is needed for the gold label.
+Because every replacement is something the model would actually emit, this avoids the
+out-of-distribution behavior an injected edit can cause. We reuse their released code and---where it
+covers the target model---their resampling dataset, and we match their exact importance metric for
+comparability. For verifiable-answer tasks the answer is discrete, so the distributional shift is a
+total-variation distance (a fine discrete default; match their metric if it differs):
+\begin{equation}
+A_i \;=\; \mathrm{TV}\!\Big(\hat p_{\text{ans}}\!\mid\!\text{real}_i,\;\;\hat p_{\text{ans}}\!\mid\!\text{diff-resample}_i\Big)
+\;=\;\tfrac12\sum_a\big|\hat p(a\mid i)-\hat p(a\mid i')\big|.
+\label{eq:label}
+\end{equation}
+Large $A_i\Rightarrow$ anchor.
+
+\paragraph{Secondary: constructed task/frame swap (construct-validity check; last compute rung).}
+On the structured tasks we can also \emph{construct} a perturbation deterministically by partitioning a
+span's tokens against the closed task vocabulary: editing the \emph{task-content} tokens (swap an
+entity/relation/value for a same-type sibling) gives a guaranteed semantically-\emph{different} edit,
+while editing only the \emph{frame} tokens (verbs, connectives) and holding the task tokens fixed gives
+a guaranteed-\emph{similar}, meaning-preserving edit (preservation holds by construction, so no
+similarity classifier is needed). Its primary value is as a zero-classifier-error
+\emph{construct-validity check} on the bAbI/synthetic stage---verifying the gold pipeline behaves
+(different moves the answer, similar does not, and a real-vs-real null gives $A\!\approx\!0$). It is
+also the last rung of the compute ladder (\S\ref{sec:groundtruth}): it guarantees a different sample in
+one shot, sparing the filter's oversampling, but at the risk of OOD prefixes and without reducing the
+core rollout count. Spans with no task-content tokens (procedural glue) have no clean swap and are
+excluded from this check (rate recorded). Not applicable to the free-form GSM8K hold-out, which has no
+closed vocabulary.
+
+\emph{Granularity.} We run resample-and-filter at our clause-window granularity
+(\S\ref{sec:granularity}); their released sentence-level labels, if they cover the target model, serve
+as a free comparability cross-check at sentence granularity.
+
+\paragraph{Pipeline.} (1) generate base traces; (2) segment into clause-windows; (3) for each span,
+dispatch the resample-and-filter rollouts batched across the 8 GPUs (the dominant cost); (4) aggregate
+answer distributions and compute \eqref{eq:label}; (5) in parallel, hook attention
+weights/values/keys, $\WO$ outputs, per-layer MLP writes, and final-layer states for the signals.
+Independent unit for power and generalization is the \emph{trace/problem}, not the span (within-trace
+spans are correlated).
+
+\subsection{Dataset curriculum}
+\label{sec:curriculum}
+A difficulty ramp through \emph{verifiable, state-tracking} reasoning---the regime where anchors are
+most pronounced and where pivotal steps are sequential and identifiable:
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{Phase 0 --- bAbI \cite{weston2015towards}:} 20 synthetic QA tasks, short and
+fully specified; pipeline debugging and the $t$/$\mathcal B$ localization sweeps. bAbI ships with
+\emph{supporting-fact annotations}---the facts required to answer each question are labeled---so
+``on-path supporting fact $=$ anchor'' is a \emph{free} constructive ground truth, independent of
+resampling, available from Phase~0 onward.
+\item \textbf{Phase 1 --- synthetic / bAbI-derived state-tracking:} use bAbI's supporting-fact labels
+(or a procedural generator with the same on-path/off-path structure) so the load-bearing facts are
+known by construction. This gives a construct-validity check: the white-box signals and the resampling
+label $A_i$ should both rank the annotated supporting facts above the distractors, independent of
+resampling noise. Build a custom generator only if finer hop-count control than bAbI offers is needed.
+\item \textbf{Phase 2 --- BBH Tracking Shuffled Objects \cite{suzgun2022challenging}:} sequential
+state updates under swaps; each swap is a candidate decision anchor.
+\item \textbf{Phase 3 --- CLUTRR \cite{sinha2019clutrr}:} compositional kinship reasoning with graded
+hop count; each relation-composition step is pivotal.
+\item \textbf{Phase 4 --- SCONE \cite{long2016simpler}:} long-horizon context-dependent instruction
+execution (alchemy/scene/tableau); the hardest state-tracking regime.
+\end{itemize}
+\emph{Rationale.} The common thread (verifiable answers $+$ sequential
+state updates) is exactly where anchors are clean and where the synthetic stage gives a constructive
+sanity check the natural datasets cannot. One addition: because the entire ramp is state-tracking, hold
+out a \emph{different} reasoning type (e.g.\ GSM8K math) purely as an out-of-distribution generalization
+test---not for training---so a positive result is not silently confined to state-tracking.
+
+\section{Ground truth}
+\label{sec:groundtruth}
+\paragraph{(A) Resampling, Eq.~\eqref{eq:label} (gold).} The resample-and-filter method of
+\cite{bogdan2025thought} (\S\ref{sec:data}). Black-box \emph{by design}: independence from the
+forward-pass signals is what makes a correlation with it meaningful and non-circular; reusing their
+metric (and dataset where it covers the model) keeps the $0.22$ comparison exact.
+
+\paragraph{Compute-reduction ladder.} Gold $R{=}100$ resampling is the dominant cost. If the budget
+bites, descend this ladder (cheapest correctness loss first), not a single fallback:
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+\item \textbf{Lower $R$}---simplest knob; the cost is noisier labels, quantified by the bootstrap CI.
+\item \textbf{Their masking + token-logits proxy} \cite{bogdan2025thought}---their own sentence-level
+measure, validated against resampling at ${\sim}100\times$ less compute; the natural first structural
+fallback because it is already benchmarked against the gold.
+\item \textbf{Lyapunov proxy (B), below}---calibrate against a small gold batch, then scale.
+\item \textbf{Constructed task/frame swap} (\S\ref{sec:data})---guarantees a different sample in one
+shot, sparing the filter's oversampling, but risks OOD and does not cut the core rollout count.
+\end{enumerate}
+
+\paragraph{(B) Lyapunov proxy.} Finite-time trajectory divergence after perturbation,
+$\Lambda_i=\tfrac1\tau\log\!\big(\norm{\zz^{\text{pert}}_{i+\tau}-\zz_{i+\tau}}/\norm{\zz^{\text{pert}}_i-\zz_i}\big)$,
+cheaper but a hidden-state quantity (circularity risk). Used only after calibration against (A), to
+scale labeling if $\mathrm{corr}(B,A)$ is high.
+
+\section{Trials}
+\label{sec:trials}
+Primary metric throughout: Spearman $\rho$ against (A), with the receiver-head baseline
+\cite{bogdan2025thought} \emph{reproduced on the same traces}, and bootstrap CIs over independent
+traces. Trials 1--4 are single-signal marginals (the fulcrum); Trial 5 is combination. They are
+exercised in the staged order of \S\ref{sec:tiers}, not necessarily in numeric sequence: a trial's cheap
+one-hop core enters in an early tier, its chained or nonlinear extensions only in later ones.
+
+\begin{description}[leftmargin=0pt,itemsep=4pt]
+\item[\textbf{Trial 1 --- Propagated attention only.}] Score spans by $P_i$ (Eq.~\ref{eq:katz}).
+Tests ``anchors route.'' Sub-analysis: $\lambda$ sweep, $E_i$ vs $P_i$ to isolate multi-hop value.
+This is the closest analogue to prior white-box work and the first thing that must clear $0.22$.
+\item[\textbf{Trial 2 --- Own computation.}] Score by $G_i$ (Eq.~\ref{eq:G}). Tests ``anchors
+\emph{are} computation sites'' (decision anchors), independent of routing.
+\item[\textbf{Trial 3 --- Gradient-scaled outflow.}] Score by $D_i$ (Eq.~\ref{eq:grad}). Tests
+``anchors \emph{drive} downstream computation,'' with proper (context-aware, first-order) credit
+assignment. We use the gradient form---rather than crude $P'$---for the reason derived in
+\S\ref{sec:gradmath}: it credits only the component of downstream computation that responds to $i$'s
+own contribution direction. If Trial~3 ties or loses to Trial~4, re-run with $D^{\mathrm{IG}}$
+(Eq.~\ref{eq:ig}) before concluding credit assignment is irrelevant (a first-order null is ambiguous).
+\emph{Reach sub-analysis:} one-hop $D_i$ vs.\ chained $\widetilde D_i$ (Eq.~\ref{eq:chained}), with a
+$\lambda$ sweep---the computation-axis analogue of $E_i$-vs-$P_i$, testing whether computational
+influence is transitive.
+\item[\textbf{Trial 4 --- Computation-weighted outflow.}] Score by $P'_i$ (Eq.~\ref{eq:Pprime}). The
+crude ``flow-into-computation'' baseline against which Trial~3 is judged; $g(\cdot)$ ablation here. The
+Trial~3-vs-4 gap quantifies how much nonlinear credit assignment buys. \emph{Reach sub-analysis:}
+one-hop $P'_i$ vs.\ chained $\widetilde P'_i$ (Eq.~\ref{eq:chained}), same $\lambda$ sweep. The best
+of $\{P'_i,\widetilde P'_i\}$ and $\{D_i,\widetilde D_i\}$ define the outflow signals carried into
+Trial~5 (5b and 5a respectively).
+\item[\textbf{Trial 5 --- Combination.}] Feature set: $\{P_i,\,G_i,\,\text{one outflow signal},\,c_i,\,
+\text{position},\,\text{span length}\}$. Two outflow variants:
+  \begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+  \item \textbf{5a:} outflow $=D_i$ (gradient-scaled).
+  \item \textbf{5b:} outflow $=P'_i$ (computation-weighted).
+  \end{itemize}
+  Each fit two ways:
+  \begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+  \item \textbf{(i) Interpretable linear:} ridge regression; with principal-component (SVD-based)
+  regression as a collinearity-robust variant, since the outflow signal and $P_i$ co-vary. Coefficients
+  \emph{are} the result (which mechanism carries the signal, and how much).
+  \item \textbf{(ii) Nonlinear:} a 2-layer MLP over the same node features, to capture interactions the
+  linear model misses (e.g.\ ``$P_i$ matters only when $G_i$ is high''). Reported \emph{beside} (i) as
+  a flexibility ceiling, not a replacement: a gain of (ii) over (i) localizes how much nonlinear
+  structure the interpretable model leaves on the table; opacity is the price.
+  \end{itemize}
+  Decision rule: keep the outflow signal in the deployed model only if it adds incremental value over
+  $P_i+G_i$; prefer 5b ($P'$, no backward pass) if 5a does not beat it; prefer (i) unless (ii)'s gain
+  exceeds the interpretability cost.
+\end{description}
+
+\paragraph{Confound controls (all trials).}
+\emph{Edge-level (sink): a prediction.} Because $E_{s\to t}$ weights by $\norm{\WO\vv}$, classic
+attention sinks (high $\alpha$, low value-norm) are \emph{demoted}; verify by contrasting the sink
+token's attention-mass vs $\F$-mass. \emph{Propagation-level (position): open.} $P_i,c_i$ over-credit
+upstream position topologically; report partial correlation with (A) after residualizing against a
+position-only null.
+
+\section{Contingency: remediating the chained signals}
+\label{sec:contingency}
+\emph{Invoked only on bad results.} If Phase~1 / Trials~3--4 return poor or position-dominated
+correlations for the chained computation signals $\widetilde P'_i,\widetilde D_i$
+(Eq.~\ref{eq:chained}), the likely cause is a pathology specific to chaining \emph{unnormalized}
+quantities, with a graded fix. The one-hop signals $P'_i,D_i$ are immune (single sums, no path
+products), so this concerns the chained variants only.
+
+\paragraph{Why chaining can fail.} Unlike attention (a softmax, bounded ${<}1$), the MLP score $G$ is
+unbounded, typically ${\gg}1$, and grows with depth; the edges $E$ are likewise unnormalized. The
+per-hop multiplier in Eq.~\eqref{eq:chained} is $\lambda\,E\,g(G)$, so on the DAG the score---though
+finite---can grow numerically and become dominated by chain \emph{length} (upstream position) rather
+than importance. Measure the distribution of $G$ in Phase~0 before choosing a control.
+
+\paragraph{Remediation ladder (cheapest / most magnitude-preserving first).}
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+\item \textbf{Don't chain.} The reach sub-analysis already tests one-hop vs.\ chained; if one-hop wins
+or ties, use it---the pathology is moot and absolute magnitude and graded $G$ are fully retained. This
+is the default unless chaining demonstrably beats one-hop.
+\item \textbf{Gain-tuning (magnitude-preserving, soft), in reach-preserving order.} Set $\lambda$ for
+\emph{reach} (the value maximizing correlation in the reach sweep), then bound blow-up with controls
+that do not shrink it:
+(a) \emph{center the multiplier}, $g(G){=}G/\overline{G}$ or $g{=}\log$, so the typical
+$g(G)\!\approx\!1$---free (no new knob), smooth, and fixes the \emph{mean} hop; try first;
+(b) \emph{per-hop cap}: clamp the per-hop term $E\,g(G)$ at a swept ceiling $c$---a hard bound that
+clips the residual \emph{tail} centering leaves, preserves the bulk magnitude and full reach, at the
+cost of one knob; compose it on top of (a);
+(c) \emph{sub-critical $\lambda$}, $\lambda\,\mathbb E[E\,g(G)]<1$---a last resort among the soft
+controls, since it bounds blow-up precisely by sacrificing the multi-hop reach you are chaining for;
+use only if (a)--(b) fail.
+(Threshold $g\in\{0,1\}$ is a side alternative that removes the $G$ amplifier entirely (gain
+$\to\lambda E$) but binarizes computation---use only if graded $G$ carries no signal.) These keep the
+edge magnitude $E$; (a)--(b) leave reach intact, (c) does not.
+\item \textbf{Structural normalization (hard bound, magnitude cost).} If (2) does not bound it,
+row-normalize incoming contributions per node so propagation becomes an \emph{average} over paths
+(stochastic-matrix / rollout--style, as in ALTI/GlobEnc): guaranteed boundedness, and out-degree
+inflation removed. This is \emph{not} global rescaling---dividing by the grand total preserves all
+proportions and fixes nothing structural---and it converts delivered force into relative \emph{share},
+discarding absolute magnitude; use only when (2) is insufficient.
+\item \textbf{Position residualization} (already in Phase~1) handles the residual ``upstream-because-
+early vs.\ upstream-because-important'' confound that no magnitude control (cap included) disentangles;
+apply regardless of the rung used.
+\end{enumerate}
+The same discipline applies more mildly to routing $P_i$ (its edges are also unnormalized); the
+$K$-stability and position controls usually suffice, but if $P_i$ is itself position-dominated,
+rungs (2)--(4) transfer.
+
+\section{Follow-up: causal interventions (Q1--Q4)}
+\label{sec:followups}
+\emph{Conditional on detection succeeding.} Correlation shows a signal tracks anchors; these test that
+the \emph{detected set} is causally load-bearing. All are attention-knockout / activation-patching
+instances \cite{rai2024how,wang2023interpretability,meng2022locating} applied at span granularity.
+
+\paragraph{Q1 --- Skipping between anchors.}
+(a) \emph{Speculative anchoring}: treat detected anchors as targets a draft must hit; test whether
+generation can leap between them. (b) \emph{Forced anchoring}: set $\alpha_{t,s}\!\leftarrow\!0$ for
+$s\notin\mathcal A$ and renormalize (retain anchor$\to$future edges); measure accuracy vs.\ unmasked.
+
+\paragraph{Q2 --- Sufficiency and necessity (noise-fill).}
+Replace non-anchor span activations with noise / mean-ablate; retained accuracy $\Rightarrow$ anchors
+\emph{sufficient}. Filling \emph{anchors} with noise should sharply degrade accuracy
+($\Rightarrow$ \emph{necessary}). The most convincing single experiment.
+
+\paragraph{Q3 --- Math/state heads.}
+On arithmetic and state-tracking items, isolate heads carrying the largest $\F$-mass into detected
+anchors; test for a compact, interpretable subroutine circuit \cite{rai2024how}.
+
+\paragraph{Q4 --- Anchor-gated speculative decoding (demoted).}
+Draft cheaply, verify expensively, fall back to single-token decoding on detecting an anchor. Noted for
+completeness only: heavily overlaps existing adaptive speculative decoding
+\cite{leviathan2023fast,liao2025reward}, the sole novelty being an interpretability-derived trigger;
+fitting a large target alongside a draft on commodity hardware is dubious. Not a headline.
+
+\paragraph{Targeted mechanistic probe.} Where Q1--Q2 confirm anchors, run pruned DecompX-through-MLP
+\cite{modarressi2023decompx} on \emph{only} the confirmed anchor positions (cheap by sparsity) to
+recover which source tokens an anchor's MLP computes over.
+
+\section{Risks}
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+\item \textbf{Core correlation may not beat $0.22$} (Trial~1--4). Primary risk; measured first.
+Better-motivated signals are better-targeted, not more \emph{likely} to correlate.
+\item \textbf{Gradient feature is first-order} (Eq.~\ref{eq:grad}); $D^{\mathrm{IG}}$ / exact ablation
+is the faithful fallback, reserved for confirmed anchors.
+\item \textbf{Positional confound} in $P_i,c_i$ is topological (distinct from the sink confound the
+edge weight demotes); controlled against a position-only null.
+\item \textbf{Granularity sensitivity}: span definition (window $t$, boundary rule) may change labels; swept
+in Phase~0 and held fixed thereafter.
+\item \textbf{OOD}: results certify anchors only within the state-tracking distribution unless the
+held-out math set transfers; cross-model claims need fresh validation.
+\item \textbf{Combiner opacity}: the 2-layer MLP forfeits the mechanistic account;
+ceiling/candidate, reported alongside---never instead of---the interpretable model.
+\item \textbf{Label-generation dependency}: the gold resample-and-filter label depends on a
+semantic-similarity filter (a classifier with a threshold), and because similar resamples are
+discarded, gross sampling can exceed the net $R{=}100$ budget. Mitigated by the Tier-0 reuse check
+(their released labels, if available) and the compute-reduction ladder (\S\ref{sec:groundtruth}); the
+constructed-swap check validates the pipeline behaves as intended.
+\item \textbf{Chained-signal blow-up}: $\widetilde P'_i,\widetilde D_i$ propagate unnormalized,
+unbounded $G$ and can be dominated by chain length; if they underperform, apply the remediation ladder
+(\S\ref{sec:contingency}). One-hop signals are immune.
+\end{itemize}
+
+\begin{thebibliography}{99}
+\small
+\bibitem{bogdan2025thought} P.~C. Bogdan, U.~Macar, N.~Nanda, A.~Conmy.
+\emph{Thought Anchors: Which LLM Reasoning Steps Matter?} arXiv:2506.19143, 2025.
+\bibitem{elhage2021mathematical} N.~Elhage et al.
+\emph{A Mathematical Framework for Transformer Circuits.} Transformer Circuits Thread, 2021.
+\bibitem{kobayashi2020attention} G.~Kobayashi, T.~Kuribayashi, S.~Yokoi, K.~Inui.
+\emph{Attention is Not Only a Weight: Analyzing Transformers with Vector Norms.} EMNLP 2020.
+\bibitem{kobayashi2021incorporating} G.~Kobayashi, T.~Kuribayashi, S.~Yokoi, K.~Inui.
+\emph{Incorporating Residual and Normalization Layers into Analysis of Self-Attention.} EMNLP 2021.
+\bibitem{ferrando2024information} J.~Ferrando, E.~Voita.
+\emph{Information Flow Routes: Automatically Interpreting Language Models at Scale.} EMNLP 2024.
+\bibitem{modarressi2023decompx} A.~Modarressi, M.~Fayyaz, E.~Aghazadeh, Y.~Yaghoobzadeh, M.~T. Pilehvar.
+\emph{DecompX: Explaining Transformers Decisions by Propagating Token Decomposition.} ACL 2023.
+\bibitem{guo2024attention} Z.~Guo et al.
+\emph{Attention Score is Not All You Need (Value-Aware Token Pruning).} EMNLP 2024.
+\bibitem{katz1953new} L.~Katz.
+\emph{A New Status Index Derived from Sociometric Analysis.} Psychometrika 18(1), 1953.
+\bibitem{sundararajan2017axiomatic} M.~Sundararajan, A.~Taly, Q.~Yan.
+\emph{Axiomatic Attribution for Deep Networks (Integrated Gradients).} ICML 2017.
+\bibitem{shrikumar2017learning} A.~Shrikumar, P.~Greenside, A.~Kundaje.
+\emph{Learning Important Features Through Propagating Activation Differences (DeepLIFT; gradient$\times$input).} ICML 2017.
+\bibitem{ancona2018towards} M.~Ancona, E.~Ceolini, C.~\"Oztireli, M.~Gross.
+\emph{Towards Better Understanding of Gradient-Based Attribution Methods for Deep Networks.} ICLR 2018.
+\bibitem{syed2023attribution} A.~Syed, C.~Rager, A.~Conmy.
+\emph{Attribution Patching Outperforms Automated Circuit Discovery.} NeurIPS 2023 / BlackboxNLP 2024. arXiv:2310.10348.
+\bibitem{hanna2024faith} M.~Hanna, S.~Pezzelle, Y.~Belinkov.
+\emph{Have Faith in Faithfulness: Going Beyond Circuit Overlap When Finding Model Mechanisms (EAP-IG).} arXiv:2403.17806, 2024.
+\bibitem{rai2024how} D.~Rai, Z.~Yao.
+\emph{How to think step-by-step: A mechanistic understanding of chain-of-thought reasoning.} arXiv:2402.18312, 2024.
+\bibitem{wang2023interpretability} K.~Wang, A.~Variengien, A.~Conmy, B.~Shlegeris, J.~Steinhardt.
+\emph{Interpretability in the Wild: a Circuit for Indirect Object Identification.} ICLR 2023.
+\bibitem{meng2022locating} K.~Meng, D.~Bau, A.~Andonian, Y.~Belinkov.
+\emph{Locating and Editing Factual Associations in GPT (ROME / causal tracing).} NeurIPS 2022.
+\bibitem{leviathan2023fast} Y.~Leviathan, M.~Kalman, Y.~Matias.
+\emph{Fast Inference from Transformers via Speculative Decoding.} ICML 2023.
+\bibitem{liao2025reward} B.~Liao et al.
+\emph{Reward-Guided Speculative Decoding for Efficient LLM Reasoning.} arXiv:2501.19324, 2025.
+\bibitem{weston2015towards} J.~Weston, A.~Bordes, S.~Chopra, A.~Rush, B.~van Merri\"enboer, A.~Joulin, T.~Mikolov.
+\emph{Towards AI-Complete Question Answering: A Set of Prerequisite Toy Tasks (bAbI).} arXiv:1502.05698, 2015.
+\bibitem{suzgun2022challenging} M.~Suzgun et al.
+\emph{Challenging BIG-Bench Tasks and Whether Chain-of-Thought Can Solve Them (BBH).} arXiv:2210.09261, 2022.
+\bibitem{sinha2019clutrr} K.~Sinha, S.~Sodhani, J.~Dong, J.~Pineau, W.~L. Hamilton.
+\emph{CLUTRR: A Diagnostic Benchmark for Inductive Reasoning from Text.} EMNLP 2019.
+\bibitem{long2016simpler} R.~Long, P.~Pasupat, P.~Liang.
+\emph{Simpler Context-Dependent Logical Forms via Model Projections (SCONE).} ACL 2016.
+\end{thebibliography}
+
+\end{document}

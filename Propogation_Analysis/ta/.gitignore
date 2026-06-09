@@ -1,0 +1,9 @@
+.venv/
+artifacts/
+data/raw/
+data/cache/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd

@@ -1,0 +1,439 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{bm}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{mdframed}
+\usepackage{titlesec}
+\usepackage{longtable}
+
+\hypersetup{colorlinks=true, linkcolor=blue!50!black, urlcolor=blue!50!black,
+  citecolor=blue!50!black}
+
+\newmdenv[linecolor=red!60!black, linewidth=0.8pt, backgroundcolor=red!3,
+  skipabove=8pt, skipbelow=8pt, innertopmargin=6pt, innerbottommargin=6pt]{honest}
+\newmdenv[linecolor=blue!55!black, linewidth=0.8pt, backgroundcolor=blue!3,
+  skipabove=8pt, skipbelow=8pt, innertopmargin=6pt, innerbottommargin=6pt]{choice}
+\newmdenv[linecolor=green!45!black, linewidth=1pt, backgroundcolor=green!4,
+  skipabove=8pt, skipbelow=8pt, innertopmargin=6pt, innerbottommargin=6pt]{gate}
+
+\titleformat{\section}{\large\bfseries}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{0.6em}{}
+
+\newcommand{\out}[1]{\texttt{#1}}      % named Tier-0 output
+\newcommand{\param}[1]{\texttt{#1}}    % parameter name
+
+\title{\textbf{V3 Implementation Document}\\[2pt]
+\large Data Contract, Tier~0 Pre-Checks, and the Tier~1 Pipeline\\
+for Online Thought-Anchor Detection}
+\author{Build specification --- companion to the V3 design report}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{honest}
+\textbf{Scope and status.} This is a \emph{build} document; the design rationale
+lives in the V3 report and is referenced, not restated. It is decision-complete
+for two things only: the data contract (Part~A, designed against every tier) and
+the Tier~0/Tier~1 pipeline (Parts~B--D). Later tiers are deliberately left as typed
+stubs (Part~E): their logic is not written, because which branch is needed is not
+known until Tier~1's diagnostics return. Blue boxes mark \emph{made choices} the
+implementer may override; red boxes mark \emph{hazards}; the green box is a hard
+\emph{gate}. Traces are \emph{self-generated} (not borrowed), so the schema is
+designed from scratch against the target model and the future $\nabla V$ probe's
+needs.
+\end{honest}
+
+\tableofcontents
+
+%==============================================================
+\section{Orientation: what is built when, and why in this order}
+\label{sec:orient}
+
+The document runs in the order of increasing commitment cost, so it reads as it
+executes. Part~A fixes the on-disk \emph{data contract} once, against the union of
+all tiers' needs, because regenerating an archive after a schema change is the
+dominant avoidable cost. Part~B (Tier~0) runs cheap checks on a handful of traces
+that can \emph{kill or redirect} the project before any labeling compute is spent;
+it emits \emph{named outputs}. Part~C is a hard go/no-go gate. Part~D (Tier~1)
+implements the first real detector and labeling run, consuming Tier~0's named
+outputs by reference. Part~E stubs later tiers.
+
+\begin{quote}\small
+\textbf{Governing rule:} plumb the storage and interfaces for the union of all
+tiers; implement the logic for only the current tier. The data contract (Part~A)
+anticipates the $\nabla V$ probe and every branch; the \emph{code} implements only
+Tier~0 and Tier~1.
+\end{quote}
+
+%==============================================================
+\section{Part A --- Shared data contract and storage schema}
+\label{sec:contract}
+
+Every tier reads from one archive with a single index. The schema is fixed now and
+treated as an invariant; later tiers add \emph{consumers}, never migrations.
+
+\subsection{Index and granularity}
+The primary key is \out{(item, trace, run, layer, token)}:
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item \out{item}: a task instance (one problem). Carries the gold answer and any
+constructive on-path/off-path fact annotations (\S\ref{sec:t0-calib}).
+\item \out{trace}: one base generation for an item (the ``real'' chain of thought).
+\item \out{run}: a rollout index. \out{run=0} is the base trace; \out{run>0} are
+real or perturbed continuations used for labels (\S\ref{sec:t1-label}).
+\item \out{layer}: the residual-stream layer index a hidden state was read from.
+\item \out{token}: absolute token position within the (prompt $+$ generation)
+sequence.
+\end{itemize}
+The independent statistical unit is the \out{trace}, never the span (within-trace
+spans are correlated).
+
+\subsection{Stored fields}
+\begin{longtable}{@{}p{0.30\textwidth}p{0.64\textwidth}@{}}
+\toprule
+Field & Content and rationale \\
+\midrule
+\out{token\_ids} & The \emph{generated} token ids (prompt and generation
+separated). Never re-tokenized text --- see hazard below. \\
+\out{char\_offsets} & Per-token character spans, so a token window maps back to
+text. \\
+\out{clause\_flags} & Per-token Stage-1 clause-boundary flags. \\
+\out{window\_flags} & Per-token Stage-2 window-boundary flags (the span edges). \\
+\out{surprisal} & Per-token $-\log P_\theta(\text{tok})$, for the potential $V$.
+Stored at generation time. \\
+\out{hidden} & Hidden states $h_t$, stored at layer set \param{layers\_stored}
+and token stride \param{store\_stride}. Sized for the \emph{future} $\nabla V$
+probe, not just Tier~1 (see \S\ref{sec:contract-stride}). \\
+\out{logits\_topk} & Top-$K_{\text{store}}$ output logprobs per stored token (for
+$V$ as a field and the KL proxy), plus tail log-mass. \\
+\out{answer\_dist} & Per-\out{run} final-answer distribution (the extracted
+discrete answer; \S\ref{sec:t1-label}). \\
+\out{A\_i} & Per-span counterfactual-importance label, once computed. \\
+\bottomrule
+\end{longtable}
+
+\begin{honest}
+\textbf{The alignment invariant (load-bearing).} Re-tokenizing stored \emph{text}
+can yield a different token count than generation produced (whitespace, special
+tokens, BPE merges at span edges), silently shifting every per-token signal
+relative to its label. The schema therefore stores \out{token\_ids} as the source
+of truth; text is derived, never re-tokenized for alignment. The Tier~0 check
+\out{alignment\_ok} (\S\ref{sec:t0-smoke}) verifies this on real traces before
+anything depends on it.
+\end{honest}
+
+\subsection{The stride decision (anticipating the probe)}
+\label{sec:contract-stride}
+\param{store\_stride} and \param{layers\_stored} are fixed \emph{now} against the
+most demanding future consumer --- the off-path $\nabla V$ probe (V3 report
+\S\,``potential and its gradient'') --- not against Tier~1, which uses far less.
+
+\begin{choice}
+\textbf{Choice (override if profiling dictates):} store \out{hidden} at
+\emph{every} token (\param{store\_stride}=1) for the Tier~0/1 trace set, at the
+single layer \param{layer\_default} (Tier~0 output) \emph{plus} the two adjacent
+layers, and store \out{logits\_topk} with $K_{\text{store}}=512$. Rationale:
+Tier~1 needs only $h$ at span edges, but the probe (a fix/improvement tier) needs
+$h$ at arbitrary positions and the upper-layer stack; storing densely on the
+\emph{small} Tier~1 trace set is cheap and removes a regeneration if a probe tier
+is later entered. At large scale (Tier~3+), \param{store\_stride} rises and only
+span-edge tokens are kept dense --- a documented later change, not a migration of
+the Tier~1 archive.
+\end{choice}
+
+\begin{honest}
+This is the one place upfront over-provisioning is justified, because the
+alternative is regenerating traces. It is \emph{not} licence to over-build
+elsewhere: only the storage is provisioned for all tiers; no probe code is written
+until a probe tier is entered.
+\end{honest}
+
+%==============================================================
+\section{Part B --- Tier 0: cheap pre-checks before any labeling}
+\label{sec:tier0}
+
+Tier~0 runs on a handful of base traces (no rollouts, no labels, no detector). Each
+check is \emph{procedure $\to$ cost $\to$ verdict $\to$ what-it-changes}, and the
+ones that produce values Tier~1 needs emit a \textbf{named output}. The asymmetry
+to keep in mind throughout: Tier~0 can \emph{kill or redirect} the project, but
+passing it means ``not obviously dead,'' never ``likely to work.''
+
+\subsection{Bucket 1 --- plumbing smoke tests (does the machinery work)}
+\label{sec:t0-smoke}
+\begin{description}[leftmargin=1.2em,style=nextline]
+\item[\out{alignment\_ok} --- token-alignment integrity]
+\emph{Procedure:} generate $\sim$5 traces; store \out{token\_ids}; independently
+re-tokenize the decoded text; compare. \emph{Cost:} minutes.
+\emph{Verdict:} pass iff counts and positions match exactly. \emph{What-it-changes:}
+\textbf{project-ender if it fails} --- every per-token signal is mislabeled
+otherwise. Fix the storage path before proceeding.
+\item[hidden-state sanity]
+\emph{Procedure:} pull \out{hidden} at \param{layer\_default} candidates; check
+shape, finiteness, and non-degeneracy (not all-equal, not exploding).
+\emph{Cost:} minutes. \emph{Verdict:} pass iff finite and varying.
+\emph{What-it-changes:} a fail means the extraction hook is wrong; fix before
+proceeding.
+\item[surprisal cross-check]
+\emph{Procedure:} compare stored \out{surprisal} against the model's own
+\texttt{log\_softmax(logits)} at the realized tokens. \emph{Cost:} minutes.
+\emph{Verdict:} pass iff they match to numerical tolerance.
+\emph{What-it-changes:} a fail means $V$ is computed wrong; fix before proceeding.
+\item[segmenter sanity]
+\emph{Procedure:} run the clause$\to$window segmenter (\S\ref{sec:t1-seg}) on real
+traces; read output by eye. \emph{Cost:} an hour. \emph{Verdict:} pass iff spans
+are well-formed (not all degenerate one-token spans; no mid-number/format splits).
+\emph{What-it-changes:} a fail sends you back to the segmentation rule, not the
+model.
+\end{description}
+
+\subsection{Bucket 2 --- assumption probes (is the premise plausible)}
+\label{sec:t0-probe}
+\begin{description}[leftmargin=1.2em,style=nextline]
+\item[\out{artifact\_verdict} --- velocity artifact domination]
+\emph{Procedure:} compute $v_t=\Delta h_t$ on a few traces; inspect whether a
+couple of outlier dimensions or monotonic norm drift dominate the variance.
+\emph{Cost:} an hour. \emph{Verdict:} record whether raw velocity is
+artifact-dominated. \emph{What-it-changes:} if dominated, the whitening metric is
+\emph{load-bearing} (not optional) --- which Tier~1 already uses, so this informs
+expectations, and a \textbf{severe} domination that whitening cannot remove is a
+redirect signal. Can kill, cannot validate.
+\item[energy computability]
+\emph{Procedure:} compute $E_t=\tfrac12 v^\top G v + V$ with a crude constant $G$
+on a few traces. \emph{Cost:} an hour. \emph{Verdict:} pass iff $E$ is finite,
+varies, and neither term swamps the other by orders of magnitude.
+\emph{What-it-changes:} a degenerate $E$ (one term dominating) means the metric
+scale or $V$ normalization needs fixing before Tier~1's Test~1 is meaningful.
+\item[\out{layer\_default} --- layer prior]
+\emph{Procedure:} eyeball trajectory structure across candidate layers
+($\sim$0.5--0.85 depth). \emph{Cost:} an hour. \emph{Verdict:} pick an informed
+default (emit \out{layer\_default}). \emph{What-it-changes:} sets Tier~1's layer
+sweep centre; not a kill check.
+\end{description}
+
+\begin{honest}
+Bucket 2's green lights are \emph{weak}. Structured-looking velocity on five traces
+means the cheap precondition is not obviously violated --- not that the dynamics
+carry anchor signal. Tier~0 can only remove the project from consideration; it
+cannot confirm it. Do not let a Bucket-2 pass become confidence.
+\end{honest}
+
+\subsection{Bucket 3 --- calibration measurements (cheap inputs Tier 1 needs)}
+\label{sec:t0-calib}
+\begin{description}[leftmargin=1.2em,style=nextline]
+\item[\out{cosine\_median} --- semantic-filter threshold]
+\emph{Procedure:} embed all spans (Sentence-BERT) over the Tier-0 trace set;
+compute the median pairwise cosine over \emph{clause-respecting spans}
+(\S\ref{sec:t1-seg}). \emph{Cost:} minutes once embeddings exist.
+\emph{Verdict:} emit \out{cosine\_median}. \emph{What-it-changes:} this \emph{is}
+the Tier-1 filter threshold; it must come from our own span distribution, never
+borrowed from the paper.
+\item[\out{rejection\_rate} --- re-draw feasibility]
+\emph{Procedure:} on a few spans, resample $i'$ and apply the
+\out{cosine\_median} filter; measure the fraction rejected. \emph{Cost:} a few
+rollouts. \emph{Verdict:} emit \out{rejection\_rate}. \emph{What-it-changes:} sets
+whether the Tier-1 re-draw budget (\param{redraw\_budget}) is realistic; a very
+high rejection rate inflates the rollout cost and must be known before launch.
+\item[\out{compute\_estimate} --- budget]
+\emph{Procedure:} from span count per trace, $R$, and \out{rejection\_rate},
+estimate total rollouts for the Tier-1 set. \emph{Cost:} arithmetic.
+\emph{Verdict:} emit \out{compute\_estimate}. \emph{What-it-changes:} go/no-go
+input; if infeasible, drop $R$ to the pilot value or shrink the trace set before
+committing.
+\end{description}
+
+%==============================================================
+\section{Part C --- Go / no-go gate}
+\label{sec:gate}
+
+\begin{gate}
+\textbf{Do not spend Tier~1 labeling compute until all of the following hold.}
+\begin{enumerate}[leftmargin=1.6em,itemsep=1pt]
+\item \out{alignment\_ok} = pass. \textbf{(Project-ender if not.)}
+\item hidden-state, surprisal, and segmenter smoke tests = pass.
+\item \out{artifact\_verdict} is not ``severe, whitening-irremovable.''
+\textbf{(Redirect if it is.)}
+\item energy computability = pass (no order-of-magnitude term domination).
+\item \out{cosine\_median}, \out{rejection\_rate}, \out{compute\_estimate}
+measured and recorded; \out{compute\_estimate} within budget.
+\item \out{layer\_default} chosen.
+\end{enumerate}
+Passing this gate means the machinery works and the premise is not obviously
+dead --- not that Tier~1 will succeed. Cross it deliberately.
+\end{gate}
+%==============================================================
+\section{Part D --- Tier 1: the minimal labeling pipeline and detector}
+\label{sec:tier1}
+
+Tier~1 is implemented in full. It consumes Tier~0's named outputs by reference
+(\out{cosine\_median}, \out{layer\_default}, \out{rejection\_rate}) and never
+restates their values. Its first job is the Test~1 diagnostic, which selects the
+detector (Branch~A or B); see the V3 report for why this is diagnostic, not
+assumed.
+
+\subsection{Parameter table (first-run defaults and sweep ranges)}
+\label{sec:t1-params}
+Every parameter the V3 report marked \textbf{sweep} is given a first-run default
+\emph{and} a range here, because an implementer needs a concrete starting value.
+Defaults are the value used for the first Tier-1 run; ranges are for the
+subsequent sweep.
+
+\begin{center}\small
+\begin{tabular}{@{}p{0.20\textwidth}p{0.18\textwidth}p{0.24\textwidth}p{0.30\textwidth}@{}}
+\toprule
+Parameter & First-run default & Sweep range & Notes \\
+\midrule
+\param{layer} & \out{layer\_default} & $0.5$--$0.85$ depth & centre from Tier~0. \\
+\param{sg\_halfwidth} $w$ & $4$ tokens & $2$--$8$ & forward half is the lag budget. \\
+\param{sg\_polyorder} & $3$ & $2$--$3$ & Savitzky--Golay order. \\
+\param{tau} (window) & $8$ tokens & $4$--$16$ & max tokens/window within a clause. \\
+\param{shrinkage} & $0.1$ (Ledoit--Wolf auto) & auto, or $0.01$--$0.3$ & for $\Sigma^{-1}$. \\
+\param{R\_pilot} & $16$ & --- & rollouts/span, pilot. \\
+\param{R\_gold} & $100$ & --- & rollouts/span, gold labels. \\
+\param{redraw\_budget} & $5$ attempts & $3$--$10$ & then drop span; check vs.\ \out{rejection\_rate}. \\
+\param{K\_store} & $512$ & --- & stored top-$K$ logprobs. \\
+\param{temperature} & $0.6$ & $0.6$--$1.0$ & resampling temperature. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{choice}
+\textbf{Choices made (override freely):} \param{R\_pilot}=16 balances label noise
+against a cheap first pass; \param{R\_gold}=100 matches the original Thought-Anchors
+rollout count. \param{redraw\_budget}=5 with drop-on-exhaustion prevents a
+hard-to-perturb span from stalling the pipeline; if \out{rejection\_rate} is high,
+raise it or accept more dropped spans. \param{sg\_halfwidth}=4 is a small lag; widen
+if velocity is noisy (Tier~0 \out{artifact\_verdict} informs this).
+\end{choice}
+
+\subsection{Stage 1+2 --- segmentation (deterministic rule)}
+\label{sec:t1-seg}
+\begin{choice}
+\textbf{Choice:} clause split via a deterministic rule on the stored
+\out{token\_ids}/\out{char\_offsets}: break at sentence terminators
+(\texttt{.!?} followed by space/newline), newlines, commas, and a fixed connective
+list \{\,\texttt{so, therefore, thus, then, because, but, and so, which means,
+hence}\,\}; then window each clause into runs of $\le\param{tau}$ tokens
+(\param{tau} default $8$, range $4$--$16$), merging a trailing fragment
+$<\!\lceil\param{tau}/2\rceil$ into its neighbour \emph{within the same clause}.
+Library: a dependency-light sentence splitter (e.g.\ \texttt{pysbd}) for sentences,
+then the rule above for clauses; do not use a parser that re-tokenizes.
+\end{choice}
+Windows never cross a clause boundary (V3 report \S\,granularity). Emit
+\out{clause\_flags} and \out{window\_flags} into the archive.
+
+\subsection{Stage 3 --- labels via perturbed resampling}
+\label{sec:t1-label}
+For each span $i$:
+\begin{enumerate}[leftmargin=1.4em,itemsep=1pt]
+\item Generate \param{R} ``real'' continuations from the prefix through $i$
+(\param{R}~=~\param{R\_pilot} for the pilot run, \param{R\_gold} for gold labels).
+\item Resample candidate $i'$; accept iff $\cos(i,i') < $ \out{cosine\_median}
+(Sentence-BERT); re-draw up to \param{redraw\_budget}, else drop the span.
+Generate \param{R} ``perturbed'' continuations from the prefix with $i\!\to\!i'$.
+\item Extract the discrete answer from each continuation (\S\ref{sec:t1-answer});
+aggregate into \out{answer\_dist} for real and perturbed.
+\item Label $A_i = \mathrm{TV}(\hat p_{\text{real}}, \hat p_{\text{pert}})
+= \tfrac12\sum_a |\hat p_{\text{real}}(a) - \hat p_{\text{pert}}(a)|$.
+\end{enumerate}
+
+\begin{choice}
+\textbf{Adjudicator choice (per the design):} the cosine-median filter is the
+headline adjudicator (scales unchanged, identical label definition across model
+sizes). NLI non-entailment is an \emph{optional} fidelity cross-check on the small
+target model only, never mixed into the primary label set.
+\end{choice}
+
+\subsection{Answer extraction (per-task rule)}
+\label{sec:t1-answer}
+\begin{choice}
+\textbf{Choice:} on the verifiable curriculum, extract the answer by a per-task
+regex/marker rule (boxed answer \texttt{\textbackslash boxed\{\}} for math;
+final-line entity for state-tracking; SAT/boolean literal for satisfiability). A
+continuation with no extractable answer is recorded as a distinct ``no-answer''
+outcome in \out{answer\_dist} (not dropped), so $A_i$ reflects answer-destruction
+too.
+\end{choice}
+
+\subsection{Stage 4 --- physics signals (the detector)}
+\label{sec:t1-phys}
+On the same traces, compute (pure array work, no extra model passes beyond stored
+fields):
+\begin{enumerate}[leftmargin=1.4em,itemsep=1pt]
+\item Velocity $v_t$: Savitzky--Golay (\param{sg\_halfwidth}, \param{sg\_polyorder})
+on \out{hidden} at \param{layer}, per token, $dt=1$.
+\item Metric $G=\Sigma^{-1}$: Ledoit--Wolf (\param{shrinkage}) on velocity
+covariance pooled over a \emph{held-out} trace split (no leakage).
+\item Potential $V$: per-span summed \out{surprisal}.
+\item Energy $E_t=\tfrac12 v^\top G v + V$; rate $dE/dt$ by centred difference
+(uses the lag).
+\end{enumerate}
+
+\subsection{The diagnostic and the two detectors}
+\label{sec:t1-detect}
+\begin{enumerate}[leftmargin=1.4em,itemsep=1pt]
+\item \textbf{Test 1 (selects the detector):} measure coasting $dE/dt$ on the
+coasting set (off-path spans from the constructive curriculum where available,
+else low-surprisal runs). If $\approx 0$: \textbf{Branch~A}, anchor score
+$|dE/dt|$. If structured decay: \textbf{Branch~B}, fit drag $C$ on coasting,
+anchor score $dE/dt + 2\mathcal F$.
+\item \textbf{Test 3 (diagnostic):} recompute the score under arc-length time;
+flag if the anchor ranking changes materially (clock artifact $\to$ a fix tier).
+\item \textbf{Test 2 deferred} (needs the $\nabla V$ probe; a Tier-2+ feature).
+\end{enumerate}
+
+\subsection{Evaluation against labels and baselines}
+\label{sec:t1-eval}
+Score per-span anchor signal against $A_i$ with Spearman correlation (trace as the
+unit), and report against both baselines on the same traces/labels: the
+length-corrected kinematic signal, and the learned step-boundary classifier
+trained on $A_i$. The two collapse checks (V3 report \S\,meaning): the
+length-corrected-kinematic comparison (collapse-to-geometry) and, once a probe tier
+exists, the $\nabla V$ ablation (collapse-to-V2).
+
+\begin{honest}
+The coasting set is bootstrapped and mildly circular (V3 report \S\,coasting). On
+the constructive curriculum, prefer the construction-time off-path label as the
+coasting set --- it needs no bootstrap and breaks the circularity. Do not let a
+provisional-score-chosen coasting set define the anchors the final score then
+``discovers.''
+\end{honest}
+
+%==============================================================
+\section{Part E --- Later tiers (typed stubs)}
+\label{sec:stubs}
+
+Not implemented. Each is a named consumer of the Part~A contract; logic is written
+only when Tier~1's outcome selects it (V3 report \S\,tiers).
+
+\begin{description}[leftmargin=1.2em,style=nextline]
+\item[\param{probe} --- off-path $\nabla V$ (fix/improvement)]
+Consumes dense \out{hidden} at \param{layer} and upper-layer stack (provisioned in
+Part~A). Enables Test~2, Branch~C, and the full impulse residual. \emph{The
+load-bearing engineering seam} (partial-forward-from-layer with cache reuse;
+model/version-specific). Stub: interface only.
+\item[Branch~B drag refinement / Branch~C gauge / Branch~D Jacobi / Branch~E
+GENERIC] Consume velocity, $V$, and (C/D) the probe Jacobian. Entered per the
+test$\to$branch routing. Stub: interface only.
+\item[first-content-token early decision (capability improvement)]
+Consumes \out{window\_flags} and the per-span first-content-token index; produces
+the lead-time/accuracy curve. Expected to \emph{cost} accuracy for lead time. Stub:
+interface only.
+\item[NLI cross-check (optional, small models)] Consumes spans; an alternative
+adjudicator, fixed per label set if used. Stub: interface only.
+\end{description}
+
+\begin{honest}
+\textbf{Bottom line.} This document is decision-complete for Tier~0, the data
+contract, and Tier~1: an implementer can build them without inventing a choice the
+document should have made. It is deliberately incomplete past Tier~1 --- not an
+omission but the same fail-cheap discipline as the experiment tiering. The next
+real information is the Tier~1 coasting-fit (Test~1) on real traces; no further
+planning substitutes for it.
+\end{honest}
+
+\end{document}

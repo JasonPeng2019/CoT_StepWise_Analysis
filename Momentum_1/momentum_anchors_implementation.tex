@@ -1,0 +1,370 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{bm}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{mdframed}
+\usepackage{longtable}
+
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
+
+\definecolor{codebg}{rgb}{0.96,0.96,0.94}
+\definecolor{codekw}{rgb}{0.55,0.0,0.45}
+\definecolor{codecm}{rgb}{0.30,0.45,0.30}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecm}\itshape,
+  showstringspaces=false,
+  breaklines=true,
+  frame=single,
+  framesep=4pt,
+  columns=fullflexible,
+}
+
+\newmdenv[linecolor=black!40,linewidth=0.5pt,backgroundcolor=black!3,
+  innertopmargin=6pt,innerbottommargin=6pt,skipabove=8pt,skipbelow=8pt]{notebox}
+\newmdenv[linecolor=red!50,linewidth=0.8pt,backgroundcolor=red!4,
+  innertopmargin=6pt,innerbottommargin=6pt,skipabove=8pt,skipbelow=8pt]{gatebox}
+
+\newcommand{\modu}[1]{\texttt{#1}}
+\newcommand{\fn}[1]{\texttt{#1}}
+
+\title{\textbf{Model Momentum III --- Implementation Guide}\\[3pt]
+\large Module Interfaces, Data Contracts, Build Order, and the Phase~0 Gate}
+\author{}
+\date{}
+
+\sloppy
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This is the build specification for the information-geometric momentum predictor of thought anchors. It is the companion to the design document (``Model Momentum III''); that document fixes \emph{what} the method is and \emph{why}, and is assumed here without re-derivation. This guide fixes the \emph{how}: the module boundaries, the on-disk data contracts, the one architectural decision (forward-pass memory) that everything organizes around, default values for every free knob, and --- most importantly --- the order in which to build and run, with cheap empirical checks gating expensive compute. The guiding principle is \textbf{design holistically, build incrementally}: all interfaces and schemas are specified up front so early plumbing anticipates late plumbing, but modules are built and run in an order that surfaces the unknown-by-reading questions (tokenizer/stop-set match, alignment round-trip, scale validity, signal-vs-baseline) before any gold-level labeling cost is paid. No production code is given; each component is specified precisely enough to implement directly.
+\end{abstract}
+
+\tableofcontents
+
+\section{How to Use This Document}
+
+Read Sections~\ref{sec:arch}--\ref{sec:knobs} (architecture, the memory decision, schemas, interfaces, knobs) \emph{before writing any code} --- they are the holistic design layer and they are coupled, so deciding them piecemeal causes rework. Then follow Section~\ref{sec:buildorder} (build order) literally; it is sequenced so that the cheapest checks run first and the single expensive step (gold labeling) sits behind a gate (Section~\ref{sec:gate}). Section~\ref{sec:deferred} lists the pieces to stub now and implement only if a test triggers them. Section~\ref{sec:checklist} is a flat checklist to track against.
+
+\section{Repository Architecture}
+\label{sec:arch}
+
+Six modules, one directional data flow. Each module's output is another's input through a file contract (Section~\ref{sec:schemas}), never through shared memory, so any stage can be re-run from stored artifacts without recomputing upstream.
+
+\begin{center}
+\begin{tabular}{@{}l l p{0.46\textwidth}@{}}
+\toprule
+\textbf{Module} & \textbf{Responsibility} & \textbf{Consumes / Produces} \\
+\midrule
+\modu{config.py}    & all knobs, paths, model id, seeds & --- / config object \\
+\modu{segment.py}   & two-stage boundary-respecting spans & trace text / span table \\
+\modu{generate.py}  & base traces + resample-and-filter labels & problems / labeled trace store \\
+\modu{model.py}     & teacher-forced logits, streaming & stored token ids / per-step logit access \\
+\modu{momentum.py}  & the geometry: $F,R,C$ per span & logits + spans / score table \\
+\modu{evaluate.py}  & partial Spearman, bootstrap, baselines & scores + labels / results \\
+\modu{tests/}       & synthetic-logit geometry checks & --- / pass/fail \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Data flow: \modu{generate} (uses \modu{segment} internally) $\rightarrow$ labeled trace store $\rightarrow$ \modu{model} re-forwards stored ids $\rightarrow$ \modu{momentum} scores $\rightarrow$ \modu{evaluate} correlates scores against stored labels. \modu{segment} is also called standalone by \modu{generate}; it is factored out because both generation and any re-segmentation must use the \emph{identical} boundary logic.
+
+\begin{notebox}
+\textbf{Single source of truth for boundaries and the content mask.} The clause/sentence parser (\modu{segment}) and the content-token stop-set (\modu{momentum}) both depend on the same notion of ``structural punctuation.'' Define that set \emph{once} in \modu{config.py} (as token ids resolved against the actual tokenizer, not characters) and import it into both. If these drift apart, spans and scores silently disagree about what a boundary is.
+\end{notebox}
+
+\section{The One Architectural Decision: Forward-Pass Memory}
+\label{sec:memory}
+
+Everything organizes around how logits are obtained and held, so decide this first. The full logit tensor for one trace is $[L, V]$ with $L\sim$ thousands and $V\sim 10^5$; materializing it in fp32 is gigabytes and is the most likely cause of an out-of-memory failure. We adopt \textbf{teacher-force-and-stream}:
+
+\begin{enumerate}[leftmargin=1.7em]
+  \item Run a single forward pass over the stored token-id sequence with caching, but \textbf{do not return all logits}. Instead, iterate positions in order and expose one logit vector at a time to the scorer.
+  \item The scorer (Section~\ref{sec:momentum-mod}) holds only: the previous \emph{content}-position scaled-logit vector $\bm{g}_{k-1}$, the EMA state $\bar{\bm{v}}$, and per-position scalar outputs. Peak extra memory is $O(V)$, not $O(LV)$.
+  \item This is byte-identical to the online form (during generation logits arrive one at a time), so offline scoring and online inference share one code path --- a property to preserve, not an accident.
+\end{enumerate}
+
+\begin{notebox}
+\textbf{Why not chunk-and-cache logits to disk.} Writing $[L,V]$ logits per trace to disk for later scoring is simpler to reason about but multiplies storage by $V$ and breaks the offline/online equivalence. We store \emph{token ids} (tiny) and re-forward when scoring; re-forwarding one trace is one cheap pass and avoids the storage blowup. The only quantity worth caching is the small per-span score table, not the logits.
+\end{notebox}
+
+\paragraph{Practical consequence for \modu{model.py}.} Its public surface is an iterator, not a tensor return. Conceptually: \fn{stream\_logits(token\_ids) -> yields (position, scaled\_logit\_vector)}, with temperature scaling applied inside. The scorer consumes the stream; nothing assembles the full matrix.
+
+\section{Data Contracts (Schemas)}
+\label{sec:schemas}
+
+All inter-module artifacts are on disk with explicit schemas. Token ids are the source of truth; text and character offsets are derived. Use a columnar/record format that stores integer arrays natively (e.g.\ Parquet or JSONL-with-arrays); the field semantics below are what matter, not the container.
+
+\subsection{Trace record (produced by \modu{generate.py})}
+One record per base trace.
+\begin{center}
+\begin{tabular}{@{}l l p{0.46\textwidth}@{}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{Meaning} \\
+\midrule
+\texttt{trace\_id}        & str           & unique key \\
+\texttt{problem\_id}      & str           & source problem (for trace-level grouping) \\
+\texttt{token\_ids}       & int[]         & the generated sequence; \textbf{source of truth} \\
+\texttt{text}             & str           & detokenization of \texttt{token\_ids} (derived) \\
+\texttt{temperature}      & float         & generation $T$ (required for the metric) \\
+\texttt{think\_start\_tok}& int           & index of first token inside \texttt{<think>} \\
+\texttt{think\_end\_tok}  & int           & index of first token after \texttt{</think>} \\
+\texttt{is\_correct}      & bool          & did this trace reach the verified answer \\
+\texttt{model\_id}        & str           & exact model+revision used \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Span record (produced by \modu{segment.py}, stored with the trace)}
+One record per span; spans tile the think region.
+\begin{center}
+\begin{tabular}{@{}l l p{0.46\textwidth}@{}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{Meaning} \\
+\midrule
+\texttt{trace\_id}    & str    & foreign key \\
+\texttt{span\_id}     & int    & ordinal within trace (also the position control) \\
+\texttt{tok\_start}   & int    & half-open start, token-id index \\
+\texttt{tok\_end}     & int    & half-open end, token-id index \\
+\texttt{char\_start}  & int    & derived, for cross-check only \\
+\texttt{char\_end}    & int    & derived, for cross-check only \\
+\texttt{unit\_id}     & int    & which parsed sentence/clause this window belongs to \\
+\texttt{n\_tokens}    & int    & \texttt{tok\_end - tok\_start} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Label record (produced by \modu{generate.py})}
+One record per span; the ground truth.
+\begin{center}
+\begin{tabular}{@{}l l p{0.46\textwidth}@{}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{Meaning} \\
+\midrule
+\texttt{trace\_id}        & str    & foreign key \\
+\texttt{span\_id}         & int    & foreign key \\
+\texttt{label}            & float  & divergence between pools (KL default; TV optional) \\
+\texttt{label\_kind}      & str    & \texttt{"kl"} or \texttt{"tv"} \\
+\texttt{n\_real}          & int    & usable same-meaning continuations \\
+\texttt{n\_diff}          & int    & usable different-meaning continuations \\
+\texttt{pool\_filled}     & bool   & did both pools reach $R$ (else span dropped) \\
+\texttt{median\_sim\_used}& float  & the dataset-median cosine threshold applied \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Score record (produced by \modu{momentum.py})}
+One record per span; the predictor side. Computed both for the content-only default and the mixed-EMA ablation, distinguished by \texttt{variant}.
+\begin{center}
+\begin{tabular}{@{}l l p{0.46\textwidth}@{}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{Meaning} \\
+\midrule
+\texttt{trace\_id}     & str    & foreign key \\
+\texttt{span\_id}      & int    & foreign key \\
+\texttt{variant}       & str    & \texttt{"content\_only"} (default) or \texttt{"mixed"} \\
+\texttt{force}         & float  & $\bar F_s$, mean Fisher force over scored steps \\
+\texttt{redirection}   & float  & $R_s\in[0,1]$, turning energy fraction \\
+\texttt{sign}          & float  & $C_s$, energy-weighted projection ($>0$ accel, $<0$ brake) \\
+\texttt{surprise}      & float  & pooled $-\log p(x)$ baseline \\
+\texttt{n\_scored}     & int    & content steps contributing ($n_s$) \\
+\texttt{beta}          & float  & EMA decay used \\
+\texttt{in\_think}     & bool   & span lies in reasoning region (not answer emission) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{notebox}
+\textbf{Join discipline.} Every downstream join is on \texttt{(trace\_id, span\_id)} against the \emph{stored} span table --- never by re-segmenting text. Before any correlation, assert that span counts per trace match across the span, label, and score tables; a mismatch is a bug, not a result.
+\end{notebox}
+
+\section{Module Interfaces}
+\label{sec:interfaces}
+
+For each module: its job, the functions to write (signatures as intent, not code), and the non-obvious correctness requirements. ``Write \fn{f(a) -> b}'' means implement a function with that input/output contract.
+
+\subsection{\modu{config.py}}
+Holds every knob (Section~\ref{sec:knobs}) and all paths in one place; no logic. Critically, it resolves and exposes the \textbf{structural-token id set} (the shared boundary/stop-set definition) against the loaded tokenizer, so \modu{segment} and \modu{momentum} import the same object. Also fixes seeds.
+
+\subsection{\modu{segment.py}}
+Job: turn a trace's token ids into the span table via the two-stage rule.
+\begin{itemize}[leftmargin=1.5em]
+  \item \fn{parse\_units(token\_ids, think\_range) -> list[unit\_span]}: stage 1, split into sentences/clauses at structural tokens (from \modu{config}). Operates on token ids; punctuation is identified by id, not by regex over text.
+  \item \fn{window\_units(unit\_spans, t, t\_min) -> list[span]}: stage 2, sub-split any unit longer than $t$ into $\le t$-token windows entirely inside the unit; merge a trailing fragment $< t_{\min}$ into the previous window of the same unit.
+  \item Correctness: windows never cross a unit boundary; spans tile the think region with no gaps or overlaps; every span carries its \texttt{unit\_id}.
+\end{itemize}
+
+\subsection{\modu{generate.py}}
+Job: produce base traces and the resample-and-filter labels. The expensive module; built only after the Phase~0 gate logic is in place. Sub-steps:
+\begin{itemize}[leftmargin=1.5em]
+  \item \fn{generate\_base\_traces(problems) -> trace records}: sample one CoT per problem at temperature $T$; store token ids, think range, correctness. Verify correctness against the task's gold answer.
+  \item \fn{resample\_slot(trace, span, R\_target, oversample\_cap) -> continuations}: for the span's slot, sample continuations \emph{from the token just before \texttt{tok\_start}} (regenerating the slot and everything after), up to \texttt{oversample\_cap}, batched across GPUs. Each continuation yields a regenerated slot text and a final answer.
+  \item \fn{embed\_and\_split(orig\_slot, continuations, median\_sim) -> (real\_pool, diff\_pool)}: embed slots with the sentence embedder; same-meaning if cosine to original $>$ \texttt{median\_sim}, different if $<$. (See the two-phase median in Section~\ref{sec:gate-seq}.)
+  \item \fn{label\_from\_pools(real\_pool, diff\_pool, kind) -> label}: aggregate each pool's final-answer distribution; label is KL (default) or TV between them. Set \texttt{pool\_filled=False} and drop the span if either pool $< R$.
+\end{itemize}
+
+\begin{notebox}
+\textbf{Oversampling and pool-fill policy (must be explicit).} The same/different split is post hoc, so some slots yield a lopsided split (a slot the model almost always regenerates near-identically gives few below-median samples). Policy: sample in batches up to \texttt{oversample\_cap} total; stop early once both pools reach $R$; if \texttt{oversample\_cap} is hit with either pool $< R$, mark \texttt{pool\_filled=False} and exclude the span from analysis (recorded, not silently dropped). Report the drop rate --- a high rate at a given $t$ is itself information about granularity.
+\end{notebox}
+
+\subsection{\modu{model.py}}
+Job: deterministic teacher-forced logit access, streaming (Section~\ref{sec:memory}).
+\begin{itemize}[leftmargin=1.5em]
+  \item \fn{load\_model(model\_id) -> (model, tokenizer)}: fixed revision, eval mode, fixed dtype.
+  \item \fn{stream\_logits(token\_ids, T) -> iterator of (pos, scaled\_logit\_vec)}: one forward pass; yields scaled logits ($\bm{g}=\bm{\ell}/T$) one position at a time; never returns the full tensor. Casts to fp32 for the vector handed out (the covariance reduction needs it).
+  \item Correctness: indexing convention is fixed --- \texttt{logits[i]} predicts token \texttt{i+1}; teacher forcing must reproduce the \emph{stored} ids exactly (no re-tokenization of text). Assert the input ids round-trip.
+\end{itemize}
+
+\subsection{\modu{momentum.py}}
+\label{sec:momentum-mod}
+Job: the geometry. Consumes the logit stream and the span table; produces the score table. This is the module to build \emph{first} (against synthetic logits), because it has no model or data dependency beyond the stream interface.
+\begin{itemize}[leftmargin=1.5em]
+  \item \fn{fisher\_cov(p, u, w) -> scalar}: the exact categorical Fisher inner product $\sum p u w - (\sum p u)(\sum p w)$, fp32.
+  \item \fn{is\_content(token\_id) -> bool}: true unless the id is in the structural/special stop-set from \modu{config}.
+  \item \fn{score\_stream(logit\_stream, is\_content, beta, variant) -> per-position (F, perp, tot, cproj)}: the streaming loop. \texttt{content\_only} variant (default): advance the trajectory only across content positions, EMA updates only on content steps, velocity is content-to-content. \texttt{mixed} variant (ablation): advance through every token, score only content. Base point is the previous content distribution $p_{k-1}$; force is $\sqrt{\mathrm{cov}(d,d)}$ with $d=v-\bar v$.
+  \item \fn{pool\_to\_spans(per\_position, spans, eps) -> score records}: $\bar F_s$ = mean force over content steps in the span; $R_s$ = $\sum\text{perp}/\sum\text{tot}$; $C_s$ = energy-weighted mean of \texttt{cproj}. Emit NaN and drop if $n_s=0$.
+  \item Correctness: EMA warmup means the first span per trace is unreliable --- flag it for dropping in \modu{evaluate}, do not special-case it here.
+\end{itemize}
+
+\subsection{\modu{evaluate.py}}
+Job: turn scores + labels into the headline numbers and the test verdicts.
+\begin{itemize}[leftmargin=1.5em]
+  \item \fn{partial\_spearman(pred, label, covars) -> rho}: rank-transform all; residualize \texttt{label} and \texttt{pred} on \{span index, span length\} by OLS; Pearson-correlate residuals.
+  \item \fn{trace\_bootstrap(table, statistic\_fn, n=1000) -> (point, ci\_low, ci\_high)}: resample \emph{traces} with replacement (never spans); recompute the statistic each draw; report $2.5/97.5$ percentiles.
+  \item \fn{run\_tests(scores, labels) -> verdicts}: compute Test 1--6 quantities (redirection partial-$\rho$, sign/taxonomy enrichment, boundary-clustering of force, transfer, blind-spot fraction, $\beta$ curve) and emit the pre-registered verdict per the design document.
+  \item Correctness: filter to reasoning-region spans (\texttt{in\_think}), drop first-span-per-trace, drop \texttt{pool\_filled=False}; always report against both \texttt{content\_only} and \texttt{mixed} so the ablation gap is visible.
+\end{itemize}
+
+\section{Knobs and Default Values}
+\label{sec:knobs}
+
+Every free parameter, with a recommended default to start from. All live in \modu{config.py}.
+\begin{center}
+\begin{tabular}{@{}l l p{0.46\textwidth}@{}}
+\toprule
+\textbf{Knob} & \textbf{Default} & \textbf{Notes} \\
+\midrule
+$\beta$ (EMA decay)        & 0.97          & memory $\approx 1/(1-\beta)$ \emph{content} tokens; swept in Test 6 \\
+$t$ (window budget)        & 15 tokens     & \emph{budget-dominating}; calibrate at Phase~0 over $\{10,15,25\}$ by label stability / drop rate \\
+$t_{\min}$ (merge floor)   & 5 tokens      & trailing fragments below this merge left \\
+motion threshold           & small $>0$    & gate $C_s$ where $\langle v,v\rangle$ is negligible; calibrate in Phase 0 \\
+$\varepsilon$              & $10^{-8}$     & denominator floor \\
+$R$ (per pool)             & 100           & \emph{budget-dominating}; ``gold'' level, but confirm sufficiency at Phase~0 \\
+oversample cap             & $\sim$8$\times R$ & ceiling on total rollouts per slot before giving up \\
+similarity threshold       & dataset median& parameter-free; computed in two phases (Sec.~\ref{sec:gate-seq}) \\
+embedder                   & Sentence-BERT & or a current sentence embedder; fixed per study \\
+label kind                 & KL            & TV optional; record which \\
+temperature $T$            & match gen.\ run& the metric must use the sampling distribution \\
+answer-region cutoff       & after \texttt{</think>} & token-id test, not heuristic \\
+bootstrap draws            & 1000          & trace-level \\
+dtype (forward)            & bf16/fp16     & covariances always fp32 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{notebox}
+\textbf{$t$ and $R$ are budget-dominating knobs --- calibrate them at Phase~0, do not fix them up front.} Most knobs above are set once and forgotten. Two are different: the window budget $t$ and the per-pool rollout count $R$ together determine the dominant compute cost of the whole study, because total rollouts scale roughly as (number of spans) $\times$ (rollouts per span) --- smaller $t$ means more spans, larger $R$ means more rollouts each. The defaults ($t=15$, $R=100$) are starting points chosen to match the sources, not validated optima. Treat them as \emph{Phase-0-calibrated}: the build order (Step~4 and the gate) deliberately measures label stability and pool-fill drop rate across $t\in\{10,15,25\}$ on the tiny set \emph{before} the gold run, so you pick the granularity that localizes anchors without an unacceptable drop rate and confirm $R$ is large enough that labels are stable, before paying for it at full scale. Committing to $t$ and $R$ up front is the most likely way to either overspend or generate a gold dataset at the wrong granularity. This is a judgement call, flagged as such: the numbers are provisional, and Phase~0 exists in part to set them.
+\end{notebox}
+
+\section{Build Order}
+\label{sec:buildorder}
+
+Build in this order. The principle: validate the math with no compute, then the plumbing with one cheap forward pass, then the full loop on a handful of traces, and only then pay for gold labeling. Each step has an explicit exit criterion.
+
+\paragraph{Step 0 --- \modu{config.py} + skeleton.} Lay down the repo, the schemas as typed records, the config with defaults, and the shared structural-token set resolved against the tokenizer. \emph{Exit:} importing any module and reading config works; the stop-set prints as actual token ids.
+
+\paragraph{Step 1 --- \modu{momentum.py} against synthetic logits.} Build the geometry and the streaming loop with \emph{no model and no data}. Feed hand-constructed logit streams from \modu{tests/}. \emph{Exit (unit tests pass):}
+\begin{itemize}[leftmargin=1.5em]
+  \item \fn{fisher\_cov} matches a brute-force covariance on random vectors; the all-ones gauge vector gives $\approx 0$.
+  \item A straight-line (constant-velocity) logit trajectory yields force $\approx 0$ (geodesic $\Rightarrow$ no force).
+  \item A trajectory that reverses direction yields $C_s<0$; a sharp turn yields high $R_s$; a speed-up along a fixed direction yields $C_s>0$, low $R_s$.
+  \item Content masking: inserting ``formatting'' positions changes nothing in the \texttt{content\_only} variant.
+\end{itemize}
+This step is seconds of compute and catches every math/indexing error before a model is ever loaded.
+
+\paragraph{Step 2 --- \modu{model.py} + single-trace alignment check.} Load the model; generate or hand-pick \emph{one} trace; store its ids; re-forward and stream. Run \modu{segment} on it and \modu{momentum} over it. \emph{Exit (the highest-value cheap check):}
+\begin{itemize}[leftmargin=1.5em]
+  \item Stored token ids round-trip: detokenize$\rightarrow$retokenize equals the stored ids (or the stream is driven by ids directly, sidestepping this).
+  \item The content stop-set actually fires on this tokenizer's punctuation/newline tokens (inspect a few positions by hand).
+  \item Spans tile the think region; \texttt{tok\_start/tok\_end} align to real clause boundaries on visual inspection.
+  \item Scores are finite, the first span is flagged, the answer region is correctly excluded.
+\end{itemize}
+Cost: one forward pass. This is where tokenizer surprises surface; do not proceed until it is clean.
+
+\paragraph{Step 3 --- \modu{evaluate.py} against mock labels.} Build the stats harness and test it on \emph{synthetic} labels (e.g.\ a known correlation injected) so the partial-Spearman and trace-bootstrap are verified independently of real data. \emph{Exit:} recovers a planted correlation; trace-bootstrap CIs widen correctly when traces (not spans) are resampled.
+
+\paragraph{Step 4 --- \modu{generate.py} + Phase 0 mini-run.} Now build the expensive module, but run it small: a handful of traces ($\sim$10--20) on the easiest task family, full resample-and-filter at $R=100$. Run the whole pipeline end to end, and use this set to \textbf{calibrate the budget-dominating knobs}: re-segment at each $t\in\{10,15,25\}$ and compare label stability and pool-fill drop rate, and check that labels are stable at $R=100$ (i.e.\ that a smaller $R$ would not have sufficed, or that $100$ is not excessive). Freeze $t$ and $R$ at the values this sweep justifies before any gold run. \emph{Exit:} the pipeline completes, emits a score+label table with sane pool-fill rates, and $t$/$R$ are chosen from data rather than assumed.
+
+\paragraph{Step 5 --- THE GATE (Section~\ref{sec:gate}).} Look at the Phase~0 numbers before scaling. Decision point, not a build step.
+
+\paragraph{Step 6 --- Gold run.} Only if the gate passes: scale \modu{generate} to the full dataset and curriculum, run the gold labeling, and produce the full results and Test 1--6 verdicts.
+
+\section{The Phase 0 Gate}
+\label{sec:gate}
+
+\begin{gatebox}
+\textbf{Do not spend gold-level compute until Phase~0 clears this gate.} After Step 4, on the tiny labeled set, check:
+\begin{enumerate}[leftmargin=1.7em]
+  \item \textbf{Plumbing sanity:} joins line up, pool-fill rate is acceptable at the chosen $t$, no NaN floods, answer region excluded. \textbf{Also fix $t$ and $R$ here:} compare label stability and drop rate across $t\in\{10,15,25\}$ and confirm $R$ is large enough that the labels are stable; these values are then frozen for the gold run.
+  \item \textbf{Direction of signal:} is the partial Spearman of $R_s$ (or $C_s$) with the label \emph{positive and plausibly nonzero}, even if not yet significant at this tiny $n$? A near-zero or negative central estimate across the whole small set is a warning.
+  \item \textbf{Baseline posture:} does the geometry at least track alongside the surprise baseline rather than being dominated by it?
+\end{enumerate}
+\textbf{Pass} $\rightarrow$ Step 6 (gold). \textbf{Fail on plumbing} $\rightarrow$ fix and re-run Phase 0 (cheap). \textbf{Fail on signal with clean plumbing} $\rightarrow$ this is a real result: invoke the design document's pre-registered responses (e.g.\ Test 3 boundary fix if force clusters at span starts; reconsider scale per the model-scale caveat) \emph{before} paying for gold. Do not scale a flat signal hoping $n$ fixes it.
+\end{gatebox}
+
+\subsection{Two-phase similarity median (sequencing constraint)}
+\label{sec:gate-seq}
+The ``different-meaning'' threshold is the dataset-median pairwise cosine similarity, so it \emph{cannot be a constant known up front}. Sequence it: (phase A) generate base traces and all resample continuations, embedding and storing similarities but \emph{not} yet splitting; (phase B) compute the global median over all collected similarities, then apply it to split every slot's pool and compute labels. In the Phase~0 mini-run, compute a provisional median on the small set; recompute the real median on the gold set before gold labeling. Record \texttt{median\_sim\_used} per label so any later re-split is reproducible.
+
+\section{Deferred-by-Design: Stub Now, Build If Triggered}
+\label{sec:deferred}
+
+Write these as named, documented stubs so the interfaces exist, but do not implement until their trigger fires. Implementing them up front is speculative work the Phase~0/test results may tell you to skip.
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Boundary fix for the small-step assumption} (Test 3 trigger: force clusters at span-initial tokens): EMA reset/down-weight at parsed boundaries, or drop the first $k$ post-boundary content tokens. Stub: a no-op hook in the scoring loop at boundary positions.
+  \item \textbf{Arc-length reparameterization} (Test 6 ablation): recompute with Fisher-arc-length time instead of the token clock. Stub: a clock-selection flag in the scorer.
+  \item \textbf{Paraphrase perturbation route} (trigger: model too large / rollout budget too high for resample-and-filter): controlled meaning-changed rewrites in place of resampling. Stub: an alternative \fn{make\_alternative} behind the same interface \modu{generate} already calls; must re-validate against a resample-and-filter subset before its labels are trusted.
+\end{itemize}
+
+\section{Cross-Cutting Correctness Requirements}
+
+A short list of invariants every module must respect, gathered so they are not buried:
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Token ids are truth.} Never reconstruct alignment from text; derive text/offsets from ids, never the reverse.
+  \item \textbf{Determinism.} Fixed model revision, fixed seeds, eval mode; teacher forcing must reproduce stored ids exactly.
+  \item \textbf{fp32 covariances.} Regardless of forward dtype.
+  \item \textbf{Trace is the unit.} Every split, bootstrap, and significance statement groups by trace, never by span.
+  \item \textbf{Both variants always.} Score \texttt{content\_only} and \texttt{mixed} every run; the gap is a reported diagnostic.
+  \item \textbf{Record, don't silently drop.} Dropped spans (pool unfilled, $n_s=0$, first-span warmup, answer region) are flagged in the tables, not removed upstream.
+  \item \textbf{One boundary definition.} Parser and content mask import the same structural-token set.
+\end{itemize}
+
+\section{Flat Build Checklist}
+\label{sec:checklist}
+
+\begin{enumerate}[leftmargin=2em]
+  \item[$\square$] \modu{config.py}: knobs, paths, seeds, shared structural-token id set resolved against tokenizer.
+  \item[$\square$] Schemas: trace, span, label, score records as typed structures with the join keys.
+  \item[$\square$] \modu{momentum.py}: \fn{fisher\_cov}, \fn{is\_content}, \fn{score\_stream} (both variants), \fn{pool\_to\_spans}.
+  \item[$\square$] \modu{tests/}: synthetic-logit geometry suite; \emph{all pass} before Step 2.
+  \item[$\square$] \modu{model.py}: \fn{load\_model}, streaming \fn{stream\_logits}; id round-trip assertion.
+  \item[$\square$] Single-trace alignment check clean (stop-set fires, spans tile, scores finite).
+  \item[$\square$] \modu{segment.py}: \fn{parse\_units}, \fn{window\_units}; tiling/no-cross invariants.
+  \item[$\square$] \modu{evaluate.py}: \fn{partial\_spearman}, \fn{trace\_bootstrap}, \fn{run\_tests}; verified on planted correlation.
+  \item[$\square$] \modu{generate.py}: base traces, \fn{resample\_slot}, \fn{embed\_and\_split} (two-phase median), \fn{label\_from\_pools}, oversample/pool-fill policy.
+  \item[$\square$] Phase 0 mini-run end to end ($\sim$10--20 traces, $R=100$).
+  \item[$\square$] \textbf{GATE:} plumbing sane, signal direction positive, baseline posture acceptable.
+  \item[$\square$] Gold run + Test 1--6 verdicts (only past the gate).
+  \item[$\square$] Stubs in place (boundary fix, arc-length, paraphrase) --- unbuilt until triggered.
+\end{enumerate}
+
+\end{document}
